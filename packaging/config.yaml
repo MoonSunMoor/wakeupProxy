@@ -1,0 +1,12 @@
+# 이 파일은 wolproxy TUI가 관리한다. 주석은 저장 시 사라지므로 메모는 note에 쓴다.
+lan_interface: eth0
+ingress_interfaces: [wg0]
+proxy_port: 13389
+wake_timeout: 120s
+wake_cooldown: 10s
+poll_interval: 2s
+clients: {}
+profiles:
+  rdp: {port: 3389, wake: auto}
+  ssh: {port: 22, wake: auto}
+targets: []
