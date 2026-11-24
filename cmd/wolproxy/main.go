@@ -15,6 +15,7 @@ import (
 
 	"github.com/MoonSunMoor/wakeupProxy/internal/arp"
 	"github.com/MoonSunMoor/wakeupProxy/internal/config"
+	"github.com/MoonSunMoor/wakeupProxy/internal/daemon"
 	"github.com/MoonSunMoor/wakeupProxy/internal/netutil"
 	"github.com/MoonSunMoor/wakeupProxy/internal/nft"
 	"github.com/MoonSunMoor/wakeupProxy/internal/proxy"
@@ -39,6 +40,7 @@ func printUsage(w io.Writer) {
 사용법:
   wolproxy [-c <경로>]                     대화형 TUI 설정 편집기 실행 (TTY 필요)
   wolproxy [-c <경로>] serve               프록시 데몬 실행 (systemd 서비스 전용)
+  wolproxy [-c <경로>] reload              실행 중인 데몬에 동기식 설정 재적재 요청
   wolproxy [-c <경로>] wake <타깃>... [--wait]
                                            타깃에 매직 패킷 송신 (--wait: 깨어날 때까지 대기)
   wolproxy [-c <경로>] check               설정 파일 검증
@@ -95,6 +97,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, isStdinTTY fu
 			return 2
 		}
 		return runServe(cfgPath, stderr)
+
+	case "reload":
+		if len(subArgs) > 0 {
+			fmt.Fprintf(stderr, "오류: 알 수 없는 인자입니다: %s\n", strings.Join(subArgs, " "))
+			return 2
+		}
+		return runReload(stderr)
 
 	case "wake":
 		return runWake(cfgPath, subArgs, stderr)
@@ -254,7 +263,7 @@ func runWake(cfgPath string, args []string, stderr io.Writer) int {
 	err = wol.WakeTargets(
 		ctx,
 		wol.UDPSender{},
-		wol.DefaultDialFunc,
+		wol.NewLANDialer(lanPfx.Addr()),
 		arpProbe,
 		bcast,
 		wakeTargets,
@@ -265,6 +274,16 @@ func runWake(cfgPath string, args []string, stderr io.Writer) int {
 	)
 	if err != nil {
 		fmt.Fprintf(stderr, "깨우기 실패: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runReload(stderr io.Writer) int {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := daemon.RequestReload(ctx, daemon.RuntimeDir()); err != nil {
+		fmt.Fprintf(stderr, "재적재 실패: %v\n", err)
 		return 1
 	}
 	return 0
@@ -284,7 +303,6 @@ func runServe(cfgPath string, stderr io.Writer) int {
 		Interfaces: netutil.SystemProvider{},
 		NFT:        nft.CLIManager{},
 		WoLSender:  wol.UDPSender{},
-		Dial:       wol.DefaultDialFunc,
 		Logger:     logger,
 	})
 
@@ -303,6 +321,42 @@ func runServe(cfgPath string, stderr io.Writer) int {
 		return 1
 	}
 
+	startedAt := time.Now().UTC()
+	rtDir := daemon.RuntimeDir()
+	publishState := func() {
+		if snap, ok := srv.Snapshot(); ok {
+			if err := daemon.WriteRuntimeState(rtDir, daemon.NewRuntimeState(cfgPath, snap, startedAt)); err != nil {
+				logger.Debug("런타임 상태 파일 기록 생략", "dir", rtDir, "error", err)
+			}
+		}
+	}
+	publishState()
+
+	doReload := func(rCtx context.Context) error {
+		_ = daemon.NotifyReloading()
+		err := srv.ReloadFromFile(rCtx)
+		if err == nil {
+			publishState()
+		}
+		_ = daemon.NotifyReady()
+		return err
+	}
+
+	ctrlSrv, ctrlErr := daemon.StartControlServer(rtDir, doReload)
+	if ctrlErr != nil {
+		logger.Warn("제어 소켓 생성 불가 (비관리 실행 모드)", "dir", rtDir, "error", ctrlErr)
+	}
+	defer func() {
+		if ctrlSrv != nil {
+			_ = ctrlSrv.Close()
+		}
+		daemon.RemoveRuntimeState(rtDir)
+	}()
+
+	if err := daemon.NotifyReady(); err != nil {
+		logger.Warn("systemd READY 알림 실패", "error", err)
+	}
+
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGTERM, os.Interrupt)
 	defer signal.Stop(sigCh)
@@ -310,12 +364,13 @@ func runServe(cfgPath string, stderr io.Writer) int {
 	for sig := range sigCh {
 		if sig == syscall.SIGHUP {
 			reloadCtx, rCancel := context.WithTimeout(ctx, 10*time.Second)
-			_ = srv.ReloadFromFile(reloadCtx)
+			_ = doReload(reloadCtx)
 			rCancel()
 			continue
 		}
 
 		logger.Info("종료 시그널 수신, 정리 중...", "signal", sig.String())
+		_ = daemon.NotifyStopping()
 		cancel()
 		shutCtx, sCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err := srv.Shutdown(shutCtx)

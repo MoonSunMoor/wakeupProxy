@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -201,5 +202,62 @@ func TestRenameAndReferenceLookup(t *testing.T) {
 	cfg.RenameProfile("ssh", "ssh-auto")
 	if got := cfg.TargetsUsingProfile("ssh-auto"); len(got) != 1 || got[0] != "pc2" {
 		t.Fatalf("expected profile rename to propagate to pc2, got %v", got)
+	}
+}
+
+func TestValidateTargetLANSubnetAndLocalCollision(t *testing.T) {
+	ifaces := testIfaces() // eth0=192.168.0.10/24, wg0=10.66.0.1/24
+
+	// 1. Target IP outside LAN subnet
+	cfg1, _, _ := ParseBytes([]byte(specExampleYAML))
+	cfg1.Targets[0].IP = "172.16.0.21"
+	if errs := Validate(cfg1, ifaces); len(errs) != 1 || errs[0].Field != "ip" {
+		t.Fatalf("expected target IP outside LAN subnet error, got: %v", errs)
+	}
+
+	// 2. Target IP equals LAN host's own IP (192.168.0.10)
+	cfg2, _, _ := ParseBytes([]byte(specExampleYAML))
+	cfg2.Targets[0].IP = "192.168.0.10"
+	if errs := Validate(cfg2, ifaces); len(errs) != 1 || !strings.Contains(errs[0].Message, "로컬 주소와 충돌") {
+		t.Fatalf("expected target IP local collision error, got: %v", errs)
+	}
+
+	// 3. Target IP equals LAN broadcast address (192.168.0.255)
+	cfg3, _, _ := ParseBytes([]byte(specExampleYAML))
+	cfg3.Targets[0].IP = "192.168.0.255"
+	if errs := Validate(cfg3, ifaces); len(errs) != 1 || !strings.Contains(errs[0].Message, "브로드캐스트") {
+		t.Fatalf("expected target IP subnet broadcast error, got: %v", errs)
+	}
+
+	// 4. Target Alias equals wg0's own IP (10.66.0.1)
+	cfg4, _, _ := ParseBytes([]byte(specExampleYAML))
+	cfg4.Targets[1].Alias = "10.66.0.1"
+	if errs := Validate(cfg4, ifaces); len(errs) != 1 || !strings.Contains(errs[0].Message, "로컬 주소와 충돌") {
+		t.Fatalf("expected alias local collision error, got: %v", errs)
+	}
+}
+
+func TestSaveAtomicCheckedRejectsConcurrentExternalModification(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+
+	cfg, _, _ := ParseBytes([]byte(specExampleYAML))
+	if _, err := SaveAtomic(cfgPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, meta, err := Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate external edit bumping mtime
+	future := time.Now().Add(3 * time.Second)
+	if err := os.Chtimes(cfgPath, future, future); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded.ProxyPort = 14400
+	if _, err := SaveAtomicChecked(cfgPath, loaded, &meta); !errors.Is(err, ErrExternalModification) {
+		t.Fatalf("expected ErrExternalModification, got: %v", err)
 	}
 }

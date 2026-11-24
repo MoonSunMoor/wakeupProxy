@@ -93,6 +93,12 @@ func ListenTCPFreebind(ctx context.Context, listenAddr string) (net.Listener, er
 // WatchClientDisconnect monitors a waiting client socket for peer FIN/RST using
 // POLLRDHUP|POLLHUP|POLLERR without consuming any initial protocol bytes (e.g. RDP/SSH)
 // queued in the kernel receive buffer, preserving splice(2) when the target wakes up.
+//
+// Note on TCP half-close: on Linux, when a waiting client aborts (e.g. Ctrl+C in ssh),
+// close(2) sends a TCP FIN segment, which surfaces as POLLRDHUP while no server bytes
+// are transmitted. Interactive protocols targeted by wolproxy (RDP, SSH) never half-close
+// their write side prior to server greeting, so pre-relay FIN is intentionally treated
+// as client cancellation ("기다리는 중 클라이언트가 끊으면 바로 중단한다").
 func WatchClientDisconnect(ctx context.Context, conn net.Conn) <-chan struct{} {
 	ch := make(chan struct{})
 	tcpConn, ok := conn.(*net.TCPConn)

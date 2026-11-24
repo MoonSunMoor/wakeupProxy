@@ -19,11 +19,11 @@ WireGuard VPN 등 신뢰된 유입 인터페이스로 들어오는 TCP 연결 �
 - **별칭(Alias) IP 지원**
   - 클라이언트 로컬 네트워크 대역과 집 LAN 대역이 겹칠 때 홈서버에 별도 주소를 추가하지 않고도 별칭 IP로 가로채 실제 타깃 IP로 중계합니다.
 - **고성능 스트림 중계 및 유휴 연결 정리**
-  - Linux `splice(2)` 경로를 활용하는 `io.Copy` 양방향 중계, TCP Keep-Alive, `CloseWrite` 기반 half-close 전달을 지원합니다.
-  - 프로파일별 `idle_timeout` / `idle_bytes` 정책으로 유휴 연결을 자동 종료할 수 있습니다.
-- **기본 거부(Default-Deny) 접근 제어와 무중단 재적재 (`SIGHUP`)**
-  - 타깃마다 허용된 클라이언트(`allow`, IP/CIDR)만 접속할 수 있으며, 허용 목록 밖 출발지는 매직 패킷을 보내지 않고 즉시 닫습니다.
-  - `systemctl reload wolproxy`(`SIGHUP`) 시 규칙을 빈틈 없이 교체하고, 유효한 기존 연결은 유지하되 권한이 회수되거나 삭제된 타깃·프로파일의 연결만 즉시 종료합니다.
+  - `idle_timeout`이 `0`(기본값)일 때 Linux `splice(2)` 커널 zero-copy 경로를 활용하는 `io.Copy` 양방향 중계, 업스트림 LAN 출발지 IP 바인딩, TCP Keep-Alive, `CloseWrite` 기반 half-close 전달을 지원합니다.
+  - 프로파일별 `idle_timeout` / `idle_bytes` 정책으로 유휴 연결을 자동 종료할 수 있습니다(유휴 추적 활성화 시 바이트 집계를 위해 사용자 공간 복사로 전환되어 `splice` 최적화는 적용되지 않습니다).
+- **기본 거부(Default-Deny) 접근 제어와 동기식 무중단 재적재**
+  - 가로채는 프로파일 포트에 대해 타깃마다 허용된 클라이언트(`allow`, IP/CIDR)만 접속할 수 있으며, 허용 목록 밖 출발지는 매직 패킷을 보내지 않고 즉시 닫습니다.
+  - `systemd` `Type=notify` 및 제어 소켓(`/run/wolproxy/control.sock`) 기반 `systemctl reload wolproxy`로 실제 검증·`nftables` 적용 성공 여부를 동기식으로 확인하며, 유효한 기존 연결은 유지하되 권한이 회수되거나 삭제·변경된 타깃·프로파일의 연결은 즉시 종료합니다.
 - **내장 TUI 설정 편집기 (Bubble Tea + Huh)**
   - `sudo wolproxy` 실행만으로 타깃·클라이언트·프로파일·전역 설정 편집, LAN ARP 기기 검색(`Ctrl+L`), MAC 자동 채우기, 검증 오류 위치 점프, 백업(`.bak`) 및 서비스 적용까지 한 번에 처리합니다.
 - **최소 권한 실행**
@@ -67,13 +67,15 @@ flowchart LR
 
 ### `.deb` 패키지 빌드 및 설치 (Debian ARM64)
 
-저장소에 포함된 순수 Go 패키저(`cmd/build-deb`)를 사용하면 Linux·macOS·Windows 어디서든 `dpkg-deb` 없이 바로 Debian 패키지를 생성할 수 있습니다.
+Linux/Debian 환경에서는 표준 `dpkg-deb --root-owner-group`(`packaging/build-deb.sh`)을 우선 사용하며, `dpkg-deb`가 없는 Windows/macOS 개발 환경에서는 순수 Go 폴백 빌더(`cmd/build-deb`)로 동일 구조의 패키지를 생성할 수 있습니다.
 
 ```bash
-# wolproxy_0.1.0_arm64.deb 생성 (기본 출력 경로: dist/)
-go run ./cmd/build-deb -version 0.1.0 -arch arm64 -out dist
-# 또는 Makefile 사용:
+# Makefile 사용 (dpkg-deb 존재 시 표준 dpkg-deb 사용, 없을 시 cmd/build-deb 폴백)
 make deb VERSION=0.1.0 ARCH=arm64
+
+# 또는 직접 실행:
+sh packaging/build-deb.sh 0.1.0 arm64 dist
+go run ./cmd/build-deb -version 0.1.0 -arch arm64 -out dist
 ```
 
 홈서버에서 패키지 설치:
@@ -159,22 +161,31 @@ targets:
 ### 주요 설정 항목
 
 - **전역 설정**
-  - `lan_interface`: 타깃 PC가 연결된 LAN 인터페이스 (서브넷 브로드캐스트 계산 및 ARP 조회에 사용)
+  - `lan_interface`: 타깃 PC가 연결된 LAN 인터페이스 (업스트림 발신 IP 고정, 서브넷 브로드캐스트 계산 및 ARP 조회에 사용)
   - `ingress_interfaces`: 연결을 가로챌 유입 인터페이스 목록 (예: `[wg0]`). 각 인터페이스의 IPv4 주소에 `IP_FREEBIND`로 `proxy_port`를 바인드합니다.
   - `proxy_port`: `nftables` 리다이렉트를 수신할 로컬 포트 (기본 `13389`)
   - `wake_timeout` / `wake_cooldown` / `poll_interval`: 깨우기 최대 대기 시간(기본 `120s`), 매직 패킷 재송신 주기(기본 `10s`), 포트 열림 확인 주기(기본 `2s`)
+    - **`wake_timeout` 기준**: 개별 클라이언트 연결마다 따로 시작되는 시간이 아니라, 해당 `(타깃, 포트)`에 대해 **공유된 깨우기 작업(`singleflight` 첫 매직 패킷 송신 및 폴링 시작 시점)** 기준으로 측정됩니다.
 - **`clients`**: 접속을 허용할 클라이언트 이름과 IPv4 주소/CIDR
 - **`profiles`**: 포트와 정책 묶음 (내장 프리셋: `rdp` `3389/auto`, `ssh` `22/auto`)
   - `wake`: `auto`(미응답 시 깨움) 또는 `never`(깨어 있을 때만 중계)
   - `idle_timeout` / `idle_bytes` (선택, 기본 `0`): `idle_timeout` 동안 양방향 합산 전송량이 `idle_bytes` 이하이면 연결 종료
+    - **`splice(2)` 동작 참고**: `idle_timeout`이 `0`일 때는 커널 zero-copy `splice(2)`가 사용되지만, `idle_timeout > 0`을 설정하면 전송 바이트 측정을 위해 사용자 공간 버퍼 복사가 일어나 `splice` 최적화가 비활성화됩니다.
 - **`targets`**: 관리할 타깃 PC 목록 (`name`, `ip`, 선택 `alias`, `mac`, `profiles`, `allow`, 선택 `note`)
   - 깨울 필요가 없는 서비스(예: SMB)는 프로파일 없이 두고 필요할 때 `wolproxy wake`로 깨워 사용할 수 있습니다.
+
+### 보안 및 동작 경계 주의사항
+
+- **`allow` 접근 제어 범위**: 타깃의 `allow` 목록은 `wolproxy`가 가로채는 `(타깃 IP·별칭, 프로파일 등록 TCP 포트)` 연결에만 적용되며, 타깃 전체에 대한 방화벽이 아닙니다. 등록되지 않은 포트나 UDP 등 가로채지 않는 트래픽의 허용·차단은 홈서버의 시스템 라우팅(`ip_forward`)과 방화벽(`forward` 체인)에서 관리해야 합니다.
+- **데몬 중지·종료 시 동작**: `wolproxy`가 종료되면 전용 `table inet wolproxy` 가로채기 규칙이 함께 삭제됩니다. 이후 이미 깨어 있는 타깃으로의 직접 라우팅 접근 가능 여부는 전적으로 홈서버의 `ip_forward` 및 시스템 방화벽 설정에 따릅니다.
+- **깨우기 대기 중 연결 취소 및 대기열 상한**: 타깃이 깨어나기 전 대기 단계에서 클라이언트가 연결을 닫거나 `FIN`(half-close, `POLLRDHUP`)을 보내면 연결 취소로 판단하여 즉시 대기를 중단합니다. 또한 과도한 대기 연결 누적을 막기 위해 타깃당 최대 32개, 전역 최대 256개의 동시 대기 연결 상한이 적용됩니다.
 
 ### 검증 항목
 
 데몬 시작, `wolproxy check`, TUI 저장 시 모두 동일한 검증기를 실행합니다.
 
 - 존재하지 않거나 IPv4가 없는 `lan_interface` / `ingress_interfaces`
+- `lan_interface` 서브넷 대역 밖의 타깃 `ip`, 서브넷 네트워크/브로드캐스트 주소, 또는 호스트 자신의 로컬 인터페이스 IP와 충돌하는 `ip` / `alias`
 - 중복된 타깃 이름·IP·별칭, 또는 LAN 인터페이스 서브넷과 겹치는 `alias`
 - 잘못된 IPv4/CIDR, 유효하지 않은 6바이트 MAC 주소, 포트 범위(`1~65535`) 이탈
 - 존재하지 않는 클라이언트·프로파일 참조, 한 타깃 내 동일 포트를 쓰는 복수 프로파일 지정
@@ -190,7 +201,8 @@ targets:
 | 명령 | 설명 |
 | --- | --- |
 | `sudo wolproxy` | 대화형 TUI 설정 편집기 실행 (`root`가 아니면 읽기 전용으로 열림, 표준 입력이 TTY가 아니면 도움말 출력 후 비정상 종료 코드 반환) |
-| `wolproxy serve` | 프록시 데몬 실행 (`systemd` 서비스 전용) |
+| `wolproxy serve` | 프록시 데몬 실행 (`systemd` `Type=notify` 서비스 전용) |
+| `sudo wolproxy reload` | 실행 중인 데몬 제어 소켓에 동기식 설정 재적재 요청 (`systemctl reload wolproxy`의 `ExecReload`에서 사용) |
 | `wolproxy wake <타깃>... [--wait]` | 지정한 타깃에 매직 패킷 송신. `--wait` 지정 시 프로파일 포트(프로파일이 없으면 ARP 응답)가 열릴 때까지 `wake_timeout` 동안 대기 |
 | `wolproxy check` | 설정 파일 유효성 검증 (정상 `0`, 오류 `0` 아님) |
 
@@ -231,6 +243,11 @@ sudo systemctl restart wolproxy
 
 # 현재 적용된 nftables 가로채기 규칙 확인
 sudo nft list table inet wolproxy
+
+# (선택) 특정 WireGuard 유닛 이후에 시작하도록 systemd 순서 추가 시
+sudo systemctl edit wolproxy
+# [Unit]
+# After=wg-quick@wg0.service
 ```
 
 ---
@@ -240,17 +257,18 @@ sudo nft list table inet wolproxy
 ```text
 .
 ├── cmd/
-│   ├── wolproxy/       # CLI 진입점 (TUI, serve, wake, check)
-│   └── build-deb/      # 순수 Go Debian (.deb) 패키지 빌더
+│   ├── wolproxy/       # CLI 진입점 (TUI, serve, reload, wake, check)
+│   └── build-deb/      # 크로스 플랫폼 폴백용 순수 Go Debian (.deb) 패키지 빌더
 ├── internal/
 │   ├── arp/            # Linux AF_PACKET raw ARP 스캔 및 Netlink 이웃 테이블 조회
-│   ├── config/         # YAML 파싱/직렬화, 주석 감지, 검증, 변경 요약(Diff), 원자적 저장
+│   ├── config/         # YAML 파싱/직렬화, 주석 감지, 검증, 변경 요약(Diff), 디렉터리 fsync 원자적 저장
+│   ├── daemon/         # systemd sd_notify 연동, 런타임 상태(state.json) 및 동기식 제어 소켓(control.sock)
 │   ├── netutil/        # 네트워크 인터페이스 추상화, IPv4/CIDR/브로드캐스트/MAC 유틸리티
 │   ├── nft/            # table inet wolproxy 생성 및 nft -f - 트랜잭션 적용/정리
-│   ├── proxy/          # IP_FREEBIND 리스너, SO_ORIGINAL_DST, 접근 제어, 깨우기 연동, 양방향 중계
-│   ├── tui/            # Bubble Tea + Huh 기반 4탭 설정 편집기 및 systemd 연동
-│   └── wol/            # 매직 패킷 생성/UDP 송신 및 타깃별 singleflight 깨우기 코디네이터
-└── packaging/          # systemd 유닛, 기본 config.yaml, Debian 패키지 스크립트
+│   ├── proxy/          # IP_FREEBIND 리스너, SO_ORIGINAL_DST, 접근 제어, 대기열 상한, 깨우기 연동, 양방향 중계
+│   ├── tui/            # Bubble Tea + Huh 기반 4탭 설정 편집기 (model/navigation/actions/save/forms/views/apply)
+│   └── wol/            # 매직 패킷 생성/UDP 송신, LAN 출발지 다이얼러 및 singleflight 깨우기 코디네이터
+└── packaging/          # systemd 유닛, 기본 config.yaml, dpkg-deb 빌드 스크립트 및 패키지 스크립트
 ```
 
 단위 및 통합 테스트 실행:

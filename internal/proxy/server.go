@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,7 +22,20 @@ import (
 	"github.com/MoonSunMoor/wakeupProxy/internal/wol"
 )
 
-const initialDialTimeout = 1 * time.Second
+const (
+	initialDialTimeout = 1 * time.Second
+
+	DefaultMaxWaitingGlobal    = 256
+	DefaultMaxWaitingPerTarget = 32
+)
+
+// RuntimeSnapshot describes the active listener/interface configuration bound by a running Server.
+type RuntimeSnapshot struct {
+	LANInterface      string   `json:"lan_interface"`
+	IngressInterfaces []string `json:"ingress_interfaces"`
+	ProxyPort         int      `json:"proxy_port"`
+	ListenAddrs       []string `json:"listen_addrs"`
+}
 
 // OriginalDstFunc extracts the pre-redirect destination IP:port from an accepted TCP connection.
 type OriginalDstFunc func(conn net.Conn) (netip.AddrPort, error)
@@ -60,6 +75,7 @@ func (r *routeEntry) matchClient(ip netip.Addr) (string, bool) {
 type compiledState struct {
 	cfg               *config.Config
 	lanInterface      string
+	lanSourceIP       netip.Addr
 	ingressInterfaces []string
 	proxyPort         int
 	wakeTimeout       time.Duration
@@ -172,6 +188,7 @@ func compileState(
 	return &compiledState{
 		cfg:               cfg.Clone(),
 		lanInterface:      lanName,
+		lanSourceIP:       lanPrefix.Addr(),
 		ingressInterfaces: append([]string(nil), ingNames...),
 		proxyPort:         proxyPort,
 		wakeTimeout:       cfg.WakeTimeout.Std(),
@@ -188,17 +205,18 @@ type trackedConn struct {
 	origDst     netip.AddrPort
 	targetName  string
 	targetIP    netip.Addr
+	mac         net.HardwareAddr
 	usedAlias   bool
 	profileName string
 	port        int
 
 	cancel context.CancelFunc
+	idle   atomic.Pointer[idleState]
 
 	mu         sync.Mutex
 	clientConn net.Conn
 	targetConn net.Conn
 	reason     string
-	idle       *idleState
 }
 
 func (tc *trackedConn) abort(reason string) {
@@ -230,30 +248,41 @@ func (tc *trackedConn) getReason(fallback string) string {
 
 // Options configures a proxy Server instance.
 type Options struct {
-	ConfigPath string
-	Interfaces netutil.Provider
-	NFT        nft.Manager
-	WoLSender  wol.Sender
-	Dial       wol.DialFunc
-	Listen     ListenFunc
-	OrigDst    OriginalDstFunc
-	Logger     *slog.Logger
-	IdleTick   time.Duration
+	ConfigPath          string
+	Interfaces          netutil.Provider
+	NFT                 nft.Manager
+	WoLSender           wol.Sender
+	Dial                wol.DialFunc
+	Listen              ListenFunc
+	OrigDst             OriginalDstFunc
+	Logger              *slog.Logger
+	IdleTick            time.Duration
+	MaxWaitingGlobal    int
+	MaxWaitingPerTarget int
 }
 
 // Server is the TCP Wake-on-LAN transparent proxy daemon.
 type Server struct {
 	opts       Options
+	customDial wol.DialFunc
 	coord      *wol.Coordinator
-	state      atomic.Pointer[compiledState]
 	nextConnID atomic.Uint64
 
-	listenersMu sync.Mutex
-	listeners   []net.Listener
-	stopSweeper context.CancelFunc
+	listenersMu     sync.Mutex
+	listenersByAddr map[string]net.Listener
+	stopSweeper     context.CancelFunc
 
-	connsMu sync.Mutex
-	conns   map[uint64]*trackedConn
+	reloadMu sync.Mutex
+
+	// connsMu serializes active compiledState swaps, ACL evaluation + connection
+	// registration, revoked-connection eviction on reload, waiting-connection quotas,
+	// and shutdown admission gating so no connection can slip past an ACL reload or shutdown.
+	connsMu         sync.Mutex
+	curState        *compiledState
+	closing         bool
+	conns           map[uint64]*trackedConn
+	waitingTotal    int
+	waitingByTarget map[string]int
 
 	wg sync.WaitGroup
 }
@@ -265,9 +294,7 @@ func NewServer(opts Options) *Server {
 	if opts.NFT == nil {
 		opts.NFT = nft.CLIManager{}
 	}
-	if opts.Dial == nil {
-		opts.Dial = wol.DefaultDialFunc
-	}
+	customDial := opts.Dial
 	if opts.Listen == nil {
 		opts.Listen = ListenTCPFreebind
 	}
@@ -286,13 +313,121 @@ func NewServer(opts Options) *Server {
 	if opts.IdleTick <= 0 {
 		opts.IdleTick = 250 * time.Millisecond
 	}
-
-	coord := wol.NewCoordinator(opts.WoLSender, opts.Dial, opts.Logger)
-	return &Server{
-		opts:  opts,
-		coord: coord,
-		conns: make(map[uint64]*trackedConn),
+	if opts.MaxWaitingGlobal <= 0 {
+		opts.MaxWaitingGlobal = DefaultMaxWaitingGlobal
 	}
+	if opts.MaxWaitingPerTarget <= 0 {
+		opts.MaxWaitingPerTarget = DefaultMaxWaitingPerTarget
+	}
+
+	srv := &Server{
+		opts:            opts,
+		customDial:      customDial,
+		listenersByAddr: make(map[string]net.Listener),
+		conns:           make(map[uint64]*trackedConn),
+		waitingByTarget: make(map[string]int),
+	}
+	srv.coord = wol.NewCoordinator(opts.WoLSender, srv.dialUpstream, opts.Logger)
+	return srv
+}
+
+func (s *Server) dialUpstream(ctx context.Context, addr string) (net.Conn, error) {
+	if s.customDial != nil {
+		return s.customDial(ctx, addr)
+	}
+	s.connsMu.Lock()
+	var lanIP netip.Addr
+	if s.curState != nil {
+		lanIP = s.curState.lanSourceIP
+	}
+	s.connsMu.Unlock()
+	return wol.NewLANDialer(lanIP)(ctx, addr)
+}
+
+func (s *Server) resolveIngressListenAddrs(ingNames []string, proxyPort int) ([]string, error) {
+	var listenAddrs []string
+	seenAddr := make(map[netip.AddrPort]bool)
+	for _, ifName := range ingNames {
+		info, err := s.opts.Interfaces.InterfaceByName(ifName)
+		if err != nil {
+			return nil, err
+		}
+		for _, ip := range info.IPv4Addrs() {
+			ap := netip.AddrPortFrom(ip, uint16(proxyPort))
+			if !seenAddr[ap] {
+				seenAddr[ap] = true
+				listenAddrs = append(listenAddrs, ap.String())
+			}
+		}
+	}
+	if len(listenAddrs) == 0 {
+		return nil, errors.New("바인드할 유입 인터페이스 IPv4 주소가 없습니다")
+	}
+	return listenAddrs, nil
+}
+
+func (s *Server) syncListeners(ctx context.Context, desiredAddrs []string, startAccept bool) ([]net.Listener, error) {
+	desiredSet := make(map[string]bool, len(desiredAddrs))
+	for _, a := range desiredAddrs {
+		desiredSet[a] = true
+	}
+
+	s.listenersMu.Lock()
+	var toBind []string
+	for _, a := range desiredAddrs {
+		if _, exists := s.listenersByAddr[a]; !exists {
+			toBind = append(toBind, a)
+		}
+	}
+	s.listenersMu.Unlock()
+
+	newlyBound := make(map[string]net.Listener, len(toBind))
+	for _, addr := range toBind {
+		ln, err := s.opts.Listen(ctx, addr)
+		if err != nil {
+			for _, prev := range newlyBound {
+				_ = prev.Close()
+			}
+			return nil, fmt.Errorf("리스너 바인드 실패(%s): %w", addr, err)
+		}
+		newlyBound[addr] = ln
+	}
+
+	var stale []net.Listener
+	var startList []net.Listener
+
+	s.listenersMu.Lock()
+	for addr, ln := range newlyBound {
+		s.listenersByAddr[addr] = ln
+		if startAccept {
+			startList = append(startList, ln)
+		}
+	}
+	for addr, ln := range s.listenersByAddr {
+		if !desiredSet[addr] {
+			delete(s.listenersByAddr, addr)
+			stale = append(stale, ln)
+		}
+	}
+	s.listenersMu.Unlock()
+
+	for _, ln := range stale {
+		_ = ln.Close()
+	}
+	for _, ln := range startList {
+		ln := ln
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.acceptLoop(ln)
+		}()
+	}
+
+	out := make([]net.Listener, 0, len(newlyBound))
+	for _, addr := range toBind {
+		out = append(out, newlyBound[addr])
+	}
+	return out, nil
 }
 
 // Start loads and validates the initial configuration, binds ingress listeners with
@@ -302,61 +437,45 @@ func (s *Server) Start(ctx context.Context, cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	s.state.Store(st)
 
-	// Bind proxy_port on every IPv4 address of each ingress interface.
-	var listenAddrs []string
-	seenAddr := make(map[netip.AddrPort]bool)
-	for _, ifName := range st.ingressInterfaces {
-		info, err := s.opts.Interfaces.InterfaceByName(ifName)
-		if err != nil {
-			return err
-		}
-		for _, ip := range info.IPv4Addrs() {
-			ap := netip.AddrPortFrom(ip, uint16(st.proxyPort))
-			if !seenAddr[ap] {
-				seenAddr[ap] = true
-				listenAddrs = append(listenAddrs, ap.String())
-			}
-		}
-	}
-	if len(listenAddrs) == 0 {
-		return errors.New("바인드할 유입 인터페이스 IPv4 주소가 없습니다")
+	listenAddrs, err := s.resolveIngressListenAddrs(st.ingressInterfaces, st.proxyPort)
+	if err != nil {
+		return err
 	}
 
-	var bound []net.Listener
-	for _, addr := range listenAddrs {
-		ln, err := s.opts.Listen(ctx, addr)
-		if err != nil {
-			for _, prev := range bound {
-				_ = prev.Close()
-			}
-			return fmt.Errorf("리스너 바인드 실패(%s): %w", addr, err)
+	bound, err := s.syncListeners(ctx, listenAddrs, false)
+	if err != nil {
+		return err
+	}
+
+	closeBound := func() {
+		s.listenersMu.Lock()
+		for k, ln := range s.listenersByAddr {
+			_ = ln.Close()
+			delete(s.listenersByAddr, k)
 		}
-		bound = append(bound, ln)
+		s.listenersMu.Unlock()
 	}
 
 	ruleset, err := nft.BuildRuleset(st.ingressInterfaces, st.proxyPort, st.cfg)
 	if err != nil {
-		for _, ln := range bound {
-			_ = ln.Close()
-		}
+		closeBound()
 		return err
 	}
 	if err := s.opts.NFT.Apply(ctx, ruleset); err != nil {
-		for _, ln := range bound {
-			_ = ln.Close()
-		}
+		closeBound()
 		return err
 	}
 
-	s.listenersMu.Lock()
-	s.listeners = bound
-	s.listenersMu.Unlock()
+	s.connsMu.Lock()
+	s.closing = false
+	s.curState = st
+	s.connsMu.Unlock()
 
 	s.opts.Logger.Info("wolproxy 데몬 시작",
 		"listen", listenAddrs,
 		"lan_interface", st.lanInterface,
+		"lan_source_ip", st.lanSourceIP.String(),
 		"ingress_interfaces", st.ingressInterfaces,
 		"targets", len(st.cfg.Targets),
 	)
@@ -381,31 +500,57 @@ func (s *Server) Start(ctx context.Context, cfg *config.Config) error {
 		}()
 	}
 
-	go func() {
-		<-ctx.Done()
-		sweepCancel()
-	}()
-
 	return nil
 }
 
-// ListenerAddrs returns the bound listener addresses (useful for testing).
+// ListenerAddrs returns the bound listener addresses sorted consistently.
 func (s *Server) ListenerAddrs() []string {
 	s.listenersMu.Lock()
 	defer s.listenersMu.Unlock()
-	out := make([]string, len(s.listeners))
-	for i, ln := range s.listeners {
-		out[i] = ln.Addr().String()
+	out := make([]string, 0, len(s.listenersByAddr))
+	for _, ln := range s.listenersByAddr {
+		out = append(out, ln.Addr().String())
 	}
+	sort.Strings(out)
 	return out
+}
+
+// Snapshot returns the currently active interface/port configuration of the running Server.
+func (s *Server) Snapshot() (RuntimeSnapshot, bool) {
+	s.connsMu.Lock()
+	st := s.curState
+	closing := s.closing
+	s.connsMu.Unlock()
+	if st == nil || closing {
+		return RuntimeSnapshot{}, false
+	}
+	return RuntimeSnapshot{
+		LANInterface:      st.lanInterface,
+		IngressInterfaces: append([]string(nil), st.ingressInterfaces...),
+		ProxyPort:         st.proxyPort,
+		ListenAddrs:       s.ListenerAddrs(),
+	}, true
 }
 
 // Shutdown stops accepting new connections, closes all active connections, and deletes
 // the nftables table cleanly (SIGTERM behavior).
 func (s *Server) Shutdown(ctx context.Context) error {
+	// Mark closing under connsMu first so any accepted socket racing with listener Close
+	// is rejected immediately and cannot register after active snapshot.
+	s.connsMu.Lock()
+	s.closing = true
+	active := make([]*trackedConn, 0, len(s.conns))
+	for _, tc := range s.conns {
+		active = append(active, tc)
+	}
+	s.connsMu.Unlock()
+
 	s.listenersMu.Lock()
-	lns := s.listeners
-	s.listeners = nil
+	lns := make([]net.Listener, 0, len(s.listenersByAddr))
+	for k, ln := range s.listenersByAddr {
+		lns = append(lns, ln)
+		delete(s.listenersByAddr, k)
+	}
 	stopSweep := s.stopSweeper
 	s.stopSweeper = nil
 	s.listenersMu.Unlock()
@@ -417,13 +562,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	for _, ln := range lns {
 		_ = ln.Close()
 	}
-
-	s.connsMu.Lock()
-	active := make([]*trackedConn, 0, len(s.conns))
-	for _, tc := range s.conns {
-		active = append(active, tc)
-	}
-	s.connsMu.Unlock()
 
 	for _, tc := range active {
 		tc.abort("shutdown")
@@ -448,16 +586,24 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// Reload validates and applies a new Config (SIGHUP behavior):
+// Reload validates and applies a new Config (SIGHUP / synchronous reload behavior):
 // - On validation or nftables failure: keeps previous config and logs error.
+// - Rebinds ingress listeners if an ingress interface's IPv4 address changed.
 // - Replaces nftables ruleset atomically in a single transaction.
-// - Keeps valid existing connections alive, while immediately closing connections whose
-//   target was deleted, profile was removed, or client IP is no longer allowed.
+// - Atomically swaps state and evicts connections whose target was deleted, IP/MAC changed,
+//   profile was removed, or client IP is no longer allowed.
 // - Logs a warning if proxy_port, ingress_interfaces, or lan_interface changed (requires restart).
 func (s *Server) Reload(ctx context.Context, newCfg *config.Config) error {
-	cur := s.state.Load()
-	if cur == nil {
-		return errors.New("서버가 아직 시작되지 않았습니다")
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+
+	s.connsMu.Lock()
+	cur := s.curState
+	closing := s.closing
+	s.connsMu.Unlock()
+
+	if cur == nil || closing {
+		return errors.New("서버가 실행 중이 아닙니다")
 	}
 
 	next, err := compileState(newCfg, s.opts.Interfaces, cur.lanInterface, cur.ingressInterfaces, cur.proxyPort)
@@ -479,6 +625,17 @@ func (s *Server) Reload(ctx context.Context, newCfg *config.Config) error {
 		)
 	}
 
+	// Re-sync ingress IPv4 listeners in case an ingress interface changed its IPv4 address.
+	desiredAddrs, err := s.resolveIngressListenAddrs(next.ingressInterfaces, next.proxyPort)
+	if err != nil {
+		s.opts.Logger.Error("설정 재적재 유입 주소 확인 실패 (기존 설정 유지)", "error", err)
+		return err
+	}
+	if _, err := s.syncListeners(ctx, desiredAddrs, true); err != nil {
+		s.opts.Logger.Error("설정 재적재 리스너 동기화 실패 (기존 설정 유지)", "error", err)
+		return err
+	}
+
 	ruleset, err := nft.BuildRuleset(next.ingressInterfaces, next.proxyPort, next.cfg)
 	if err != nil {
 		s.opts.Logger.Error("설정 재적재 규칙 생성 실패 (기존 설정 유지)", "error", err)
@@ -489,11 +646,29 @@ func (s *Server) Reload(ctx context.Context, newCfg *config.Config) error {
 		return err
 	}
 
-	s.state.Store(next)
-	evicted := s.evictRevokedConnections(next)
+	// Swap active state and collect revoked connections under the same connsMu critical section
+	// used by handleConn's ACL check + registration.
+	s.connsMu.Lock()
+	if s.closing {
+		s.connsMu.Unlock()
+		return errors.New("서버가 종료 중입니다")
+	}
+	s.curState = next
+	var revoked []*trackedConn
+	for _, tc := range s.conns {
+		if !isConnStillAuthorized(next, tc) {
+			revoked = append(revoked, tc)
+		}
+	}
+	s.connsMu.Unlock()
+
+	for _, tc := range revoked {
+		tc.abort("config_reload")
+	}
+
 	s.opts.Logger.Info("설정 재적재 완료",
 		"targets", len(next.cfg.Targets),
-		"closed_connections", evicted,
+		"closed_connections", len(revoked),
 	)
 	return nil
 }
@@ -508,43 +683,61 @@ func (s *Server) ReloadFromFile(ctx context.Context) error {
 	return s.Reload(ctx, cfg)
 }
 
-func (s *Server) evictRevokedConnections(next *compiledState) int {
-	s.connsMu.Lock()
-	snapshot := make([]*trackedConn, 0, len(s.conns))
-	for _, tc := range s.conns {
-		snapshot = append(snapshot, tc)
+func isConnStillAuthorized(next *compiledState, tc *trackedConn) bool {
+	route, ok := next.routes[tc.origDst]
+	if !ok {
+		return false
 	}
-	s.connsMu.Unlock()
+	if route.targetName != tc.targetName ||
+		route.targetIP != tc.targetIP ||
+		!bytes.Equal(route.mac, tc.mac) ||
+		route.usedAlias != tc.usedAlias ||
+		route.profileName != tc.profileName ||
+		route.port != tc.port {
+		return false
+	}
+	_, allowed := route.matchClient(tc.clientIP)
+	return allowed
+}
 
-	evicted := 0
-	for _, tc := range snapshot {
-		route, ok := next.routes[tc.origDst]
-		if !ok {
-			tc.abort("config_reload")
-			evicted++
-			continue
-		}
-		if route.targetName != tc.targetName ||
-			route.targetIP != tc.targetIP ||
-			route.usedAlias != tc.usedAlias ||
-			route.profileName != tc.profileName ||
-			route.port != tc.port {
-			tc.abort("config_reload")
-			evicted++
-			continue
-		}
-		if _, allowed := route.matchClient(tc.clientIP); !allowed {
-			tc.abort("config_reload")
-			evicted++
-			continue
-		}
+func (s *Server) acquireWakeSlot(targetName string) bool {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	if s.closing {
+		return false
 	}
-	return evicted
+	if s.waitingTotal >= s.opts.MaxWaitingGlobal {
+		return false
+	}
+	if s.waitingByTarget[targetName] >= s.opts.MaxWaitingPerTarget {
+		return false
+	}
+	s.waitingTotal++
+	s.waitingByTarget[targetName]++
+	return true
+}
+
+func (s *Server) releaseWakeSlot(targetName string) {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	if s.waitingTotal > 0 {
+		s.waitingTotal--
+	}
+	if cur := s.waitingByTarget[targetName]; cur <= 1 {
+		delete(s.waitingByTarget, targetName)
+	} else {
+		s.waitingByTarget[targetName] = cur - 1
+	}
 }
 
 func (s *Server) runIdleSweeper(ctx context.Context) {
 	ticker := time.NewTicker(s.opts.IdleTick)
 	defer ticker.Stop()
+
+	type idleCandidate struct {
+		tc   *trackedConn
+		idle *idleState
+	}
 
 	for {
 		select {
@@ -552,17 +745,17 @@ func (s *Server) runIdleSweeper(ctx context.Context) {
 			return
 		case now := <-ticker.C:
 			s.connsMu.Lock()
-			var candidates []*trackedConn
+			candidates := make([]idleCandidate, 0, len(s.conns))
 			for _, tc := range s.conns {
-				if tc.idle != nil {
-					candidates = append(candidates, tc)
+				if st := tc.idle.Load(); st != nil {
+					candidates = append(candidates, idleCandidate{tc: tc, idle: st})
 				}
 			}
 			s.connsMu.Unlock()
 
-			for _, tc := range candidates {
-				if tc.idle.check(now) {
-					tc.abort("idle_timeout")
+			for _, cand := range candidates {
+				if cand.idle.check(now) {
+					cand.tc.abort("idle_timeout")
 				}
 			}
 		}
@@ -605,11 +798,6 @@ func extractRemoteIPv4(addr net.Addr) (netip.Addr, bool) {
 
 func (s *Server) handleConn(clientConn net.Conn) {
 	startedAt := time.Now()
-	st := s.state.Load()
-	if st == nil {
-		_ = clientConn.Close()
-		return
-	}
 
 	clientIP, ok := extractRemoteIPv4(clientConn.RemoteAddr())
 	if !ok {
@@ -627,26 +815,40 @@ func (s *Server) handleConn(clientConn net.Conn) {
 		return
 	}
 
-	// Reject direct non-redirected connections where original dst equals listener's own IP:port
-	// unless explicitly routed.
+	var localAP netip.AddrPort
+	var hasLocalAP bool
 	if localTCP, ok := clientConn.LocalAddr().(*net.TCPAddr); ok {
 		if localIP, ipOK := netip.AddrFromSlice(localTCP.IP); ipOK {
-			localAP := netip.AddrPortFrom(localIP.Unmap(), uint16(localTCP.Port))
-			if origDst == localAP {
-				if _, routed := st.routes[origDst]; !routed {
-					s.opts.Logger.Warn("연결 거부: 알 수 없는 목적지(직접 접속)",
-						"client_ip", clientIP.String(),
-						"orig_dst", origDst.String(),
-					)
-					_ = clientConn.Close()
-					return
-				}
-			}
+			localAP = netip.AddrPortFrom(localIP.Unmap(), uint16(localTCP.Port))
+			hasLocalAP = true
+		}
+	}
+
+	// Atomically check server state, route, ACL, and register trackedConn under connsMu
+	// so Reload() and Shutdown() never race with connection admission.
+	s.connsMu.Lock()
+	if s.closing || s.curState == nil {
+		s.connsMu.Unlock()
+		_ = clientConn.Close()
+		return
+	}
+	st := s.curState
+
+	if hasLocalAP && origDst == localAP {
+		if _, routed := st.routes[origDst]; !routed {
+			s.connsMu.Unlock()
+			s.opts.Logger.Warn("연결 거부: 알 수 없는 목적지(직접 접속)",
+				"client_ip", clientIP.String(),
+				"orig_dst", origDst.String(),
+			)
+			_ = clientConn.Close()
+			return
 		}
 	}
 
 	route, ok := st.routes[origDst]
 	if !ok {
+		s.connsMu.Unlock()
 		s.opts.Logger.Warn("연결 거부: 등록되지 않은 목적지",
 			"client_ip", clientIP.String(),
 			"orig_dst", origDst.String(),
@@ -657,10 +859,13 @@ func (s *Server) handleConn(clientConn net.Conn) {
 
 	clientName, allowed := route.matchClient(clientIP)
 	if !allowed {
+		targetName := route.targetName
+		port := route.port
+		s.connsMu.Unlock()
 		s.opts.Logger.Warn("연결 거부: 허용 목록 밖 출발지",
 			"client_ip", clientIP.String(),
-			"target", route.targetName,
-			"port", route.port,
+			"target", targetName,
+			"port", port,
 			"orig_dst", origDst.String(),
 		)
 		_ = clientConn.Close()
@@ -675,14 +880,13 @@ func (s *Server) handleConn(clientConn net.Conn) {
 		origDst:     origDst,
 		targetName:  route.targetName,
 		targetIP:    route.targetIP,
+		mac:         append(net.HardwareAddr(nil), route.mac...),
 		usedAlias:   route.usedAlias,
 		profileName: route.profileName,
 		port:        route.port,
 		cancel:      cancel,
 		clientConn:  clientConn,
 	}
-
-	s.connsMu.Lock()
 	s.conns[tc.id] = tc
 	s.connsMu.Unlock()
 
@@ -697,7 +901,7 @@ func (s *Server) handleConn(clientConn net.Conn) {
 	// Step 2: Initial connection attempt to real target IP:port with 1s timeout.
 	upstreamAddr := net.JoinHostPort(route.targetIP.String(), strconv.Itoa(route.port))
 	dialCtx, dialCancel := context.WithTimeout(connCtx, initialDialTimeout)
-	targetConn, dialErr := s.opts.Dial(dialCtx, upstreamAddr)
+	targetConn, dialErr := s.dialUpstream(dialCtx, upstreamAddr)
 	dialCancel()
 
 	if dialErr != nil {
@@ -709,48 +913,64 @@ func (s *Server) handleConn(clientConn net.Conn) {
 			s.logConnClosed(tc, 0, time.Since(startedAt), "wake_never")
 			return
 		}
-
-		// Watch for client disconnecting while waiting for target to wake up.
-		watchCtx, watchCancel := context.WithCancel(connCtx)
-		clientGone := WatchClientDisconnect(watchCtx, clientConn)
-
-		waitCtx, waitCancel := context.WithCancel(connCtx)
-		go func() {
-			select {
-			case <-clientGone:
-				tc.mu.Lock()
-				if tc.reason == "" && watchCtx.Err() == nil {
-					tc.reason = "client_disconnected"
-				}
-				tc.mu.Unlock()
-				waitCancel()
-			case <-watchCtx.Done():
-			}
-		}()
-
-		wokenConn, _, wakeErr := s.coord.WaitAndDial(waitCtx, wol.WakeRequest{
-			TargetName:    route.targetName,
-			TargetIP:      route.targetIP,
-			MAC:           route.mac,
-			BroadcastAddr: route.broadcastAddr,
-			Port:          route.port,
-			WakeTimeout:   st.wakeTimeout,
-			WakeCooldown:  st.wakeCooldown,
-			PollInterval:  st.pollInterval,
-			DialTimeout:   initialDialTimeout,
-		})
-		watchCancel()
-		waitCancel()
-
-		if wakeErr != nil {
-			fallback := "wake_failed"
-			if errors.Is(wakeErr, wol.ErrWakeTimeout) {
-				fallback = "wake_timeout"
-			}
-			s.logConnClosed(tc, 0, time.Since(startedAt), tc.getReason(fallback))
+		if !s.acquireWakeSlot(route.targetName) {
+			s.opts.Logger.Warn("연결 거부: 깨우기 대기 연결 수 제한 초과",
+				"client_ip", clientIP.String(),
+				"target", route.targetName,
+				"port", route.port,
+			)
+			s.logConnClosed(tc, 0, time.Since(startedAt), "wake_limit_exceeded")
 			return
 		}
-		targetConn = wokenConn
+
+		targetConn = func() net.Conn {
+			defer s.releaseWakeSlot(route.targetName)
+
+			// Watch for client disconnecting while waiting for target to wake up.
+			watchCtx, watchCancel := context.WithCancel(connCtx)
+			clientGone := WatchClientDisconnect(watchCtx, clientConn)
+
+			waitCtx, waitCancel := context.WithCancel(connCtx)
+			go func() {
+				select {
+				case <-clientGone:
+					tc.mu.Lock()
+					if tc.reason == "" && watchCtx.Err() == nil {
+						tc.reason = "client_disconnected"
+					}
+					tc.mu.Unlock()
+					waitCancel()
+				case <-watchCtx.Done():
+				}
+			}()
+
+			wokenConn, _, wakeErr := s.coord.WaitAndDial(waitCtx, wol.WakeRequest{
+				TargetName:    route.targetName,
+				TargetIP:      route.targetIP,
+				MAC:           route.mac,
+				BroadcastAddr: route.broadcastAddr,
+				Port:          route.port,
+				WakeTimeout:   st.wakeTimeout,
+				WakeCooldown:  st.wakeCooldown,
+				PollInterval:  st.pollInterval,
+				DialTimeout:   initialDialTimeout,
+			})
+			watchCancel()
+			waitCancel()
+
+			if wakeErr != nil {
+				fallback := "wake_failed"
+				if errors.Is(wakeErr, wol.ErrWakeTimeout) {
+					fallback = "wake_timeout"
+				}
+				s.logConnClosed(tc, 0, time.Since(startedAt), tc.getReason(fallback))
+				return nil
+			}
+			return wokenConn
+		}()
+		if targetConn == nil {
+			return
+		}
 	}
 
 	tc.mu.Lock()
@@ -763,11 +983,13 @@ func (s *Server) handleConn(clientConn net.Conn) {
 		return
 	}
 	tc.targetConn = targetConn
-	if route.idleTimeout > 0 {
-		tc.idle = newIdleState(time.Now(), route.idleTimeout, route.idleBytes)
-	}
-	idle := tc.idle
 	tc.mu.Unlock()
+
+	var idle *idleState
+	if route.idleTimeout > 0 {
+		idle = newIdleState(time.Now(), route.idleTimeout, route.idleBytes)
+		tc.idle.Store(idle)
+	}
 
 	totalBytes, upErr, downErr := relayBidirectional(clientConn, targetConn, idle)
 

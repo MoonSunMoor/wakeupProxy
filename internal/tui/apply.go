@@ -7,10 +7,24 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+
+	"github.com/MoonSunMoor/wakeupProxy/internal/daemon"
 )
 
-// ServiceManager abstracts systemd reload/restart and journald log inspection.
+// DaemonStatus describes whether the wolproxy service is currently active and,
+// when available from /run/wolproxy/state.json, which listener/interface settings
+// the live daemon process actually bound.
+type DaemonStatus struct {
+	Active            bool
+	HasRuntimeState   bool
+	LANInterface      string
+	IngressInterfaces []string
+	ProxyPort         int
+}
+
+// ServiceManager abstracts systemd reload/restart, live daemon status, and journald log inspection.
 type ServiceManager interface {
+	Status(ctx context.Context) DaemonStatus
 	Reload(ctx context.Context) error
 	Restart(ctx context.Context) error
 	RecentLogs(ctx context.Context, lines int) string
@@ -18,7 +32,8 @@ type ServiceManager interface {
 
 // SystemdManager invokes systemctl and journalctl for the wolproxy unit.
 type SystemdManager struct {
-	UnitName string
+	UnitName   string
+	RuntimeDir string
 }
 
 func (m SystemdManager) unit() string {
@@ -28,9 +43,35 @@ func (m SystemdManager) unit() string {
 	return "wolproxy"
 }
 
+func (m SystemdManager) runtimeDir() string {
+	if m.RuntimeDir != "" {
+		return m.RuntimeDir
+	}
+	return daemon.RuntimeDir()
+}
+
+func (m SystemdManager) Status(ctx context.Context) DaemonStatus {
+	unit := m.unit()
+	checkCmd := exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit)
+	if err := checkCmd.Run(); err != nil {
+		return DaemonStatus{Active: false}
+	}
+	rt, ok, err := daemon.ReadRuntimeState(m.runtimeDir())
+	if err == nil && ok {
+		return DaemonStatus{
+			Active:            true,
+			HasRuntimeState:   true,
+			LANInterface:      rt.LANInterface,
+			IngressInterfaces: append([]string(nil), rt.IngressInterfaces...),
+			ProxyPort:         rt.ProxyPort,
+		}
+	}
+	return DaemonStatus{Active: true}
+}
+
 func (m SystemdManager) Reload(ctx context.Context) error {
 	unit := m.unit()
-	// If the service is not yet running (e.g. initial setup), start it; otherwise reload (SIGHUP).
+	// If the service is not yet running (e.g. initial setup), start it; otherwise reload synchronously.
 	checkCmd := exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit)
 	if err := checkCmd.Run(); err != nil {
 		return runSystemctl(ctx, "start", unit)

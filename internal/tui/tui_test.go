@@ -22,6 +22,11 @@ type fakeService struct {
 	restarts int
 	failErr  error
 	logs     string
+	status   DaemonStatus
+}
+
+func (s *fakeService) Status(_ context.Context) DaemonStatus {
+	return s.status
 }
 
 func (s *fakeService) Reload(_ context.Context) error {
@@ -101,7 +106,16 @@ targets:
 		t.Fatal(err)
 	}
 
-	svc := &fakeService{logs: "systemd error line 1\nsystemd error line 2"}
+	svc := &fakeService{
+		logs: "systemd error line 1\nsystemd error line 2",
+		status: DaemonStatus{
+			Active:            true,
+			HasRuntimeState:   true,
+			LANInterface:      "eth0",
+			IngressInterfaces: []string{"wg0"},
+			ProxyPort:         13389,
+		},
+	}
 	arpMock := &fakeARP{
 		awake: map[netip.Addr]bool{netip.MustParseAddr("192.168.0.21"): false},
 		macs:  map[netip.Addr]string{netip.MustParseAddr("192.168.0.55"): "aa:bb:cc:dd:ee:55"},
@@ -348,5 +362,38 @@ func TestProfilePresetPickerAndMACAutoFill(t *testing.T) {
 	m = next.(*Model)
 	if m.tDraft.mac != "aa:bb:cc:dd:ee:55" {
 		t.Fatalf("expected MAC auto-fill to populate aa:bb:cc:dd:ee:55, got %q", m.tDraft.mac)
+	}
+}
+
+func TestRunningDaemonStateDiffAndFailedReloadHandling(t *testing.T) {
+	m, _, svc, _, _ := setupTestModel(t, true)
+
+	// Case 1: Reload failure displays journald logs and does NOT update appliedCfg
+	m.cfg.WakeTimeout = config.Duration(90 * time.Second)
+	svc.failErr = errors.New("reload rejected by daemon")
+	m, _ = sendKey(m, "s")
+	m, cmd := sendKey(m, "y")
+	next, _ := m.Update(cmd())
+	m = next.(*Model)
+	if m.screen != screenNotice || !strings.Contains(m.noticeBody, "systemd error line 1") {
+		t.Fatalf("expected reload failure notice with journald logs, got screen=%v body=%q", m.screen, m.noticeBody)
+	}
+	if m.appliedCfg.WakeTimeout == config.Duration(90*time.Second) {
+		t.Fatal("failed reload must not mark appliedCfg as updated")
+	}
+	m, _ = sendKey(m, "enter") // close notice
+	svc.failErr = nil
+
+	// Case 2: Disk config has proxy_port=13389, but live running daemon is actually bound to 12000
+	// (e.g. config.yaml was edited outside TUI without restarting daemon).
+	// Pressing 's' -> 'y' must compare against live DaemonStatus and prompt for restart!
+	svc.status.ProxyPort = 12000
+	m, _ = sendKey(m, "s")
+	m, _ = sendKey(m, "y")
+	if m.screen != screenConfirmRestart {
+		t.Fatalf("expected screenConfirmRestart when live daemon port(12000) differs from config(13389), got %v", m.screen)
+	}
+	if !strings.Contains(m.View(), "proxy_port") {
+		t.Fatalf("expected proxy_port listed in restart confirmation:\n%s", m.View())
 	}
 }

@@ -515,3 +515,291 @@ func TestClientDisconnectCancelsWakeWaitImmediately(t *testing.T) {
 		t.Fatalf("expected WoL resend loop to stop after client disconnect, got %d -> %d", sentAtAbort, after)
 	}
 }
+
+func TestClientHalfCloseDuringWakeCancelsImmediately(t *testing.T) {
+	probeLn, _ := net.Listen("tcp4", "127.0.0.1:0")
+	proxyPort := probeLn.Addr().(*net.TCPAddr).Port
+	_ = probeLn.Close()
+
+	cfg := &config.Config{
+		LANInterface:      "eth0",
+		IngressInterfaces: []string{"wg0"},
+		ProxyPort:         proxyPort,
+		WakeTimeout:       config.Duration(10 * time.Second),
+		WakeCooldown:      config.Duration(300 * time.Millisecond),
+		PollInterval:      config.Duration(60 * time.Millisecond),
+		Clients: map[string]config.Client{
+			"laptop": {CIDR: "127.0.0.1/32"},
+		},
+		Profiles: map[string]config.Profile{
+			"ssh": {Port: 22, Wake: config.WakeAuto},
+		},
+		Targets: []config.Target{
+			{
+				Name:     "pc1",
+				IP:       "192.168.0.21",
+				MAC:      "aa:bb:cc:dd:ee:01",
+				Profiles: []string{"ssh"},
+				Allow:    []string{"laptop"},
+			},
+		},
+	}
+
+	srv := NewServer(Options{
+		Interfaces: testProxyInterfaces(),
+		NFT:        &fakeNFT{},
+		WoLSender:  &fakeWoLSender{},
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OrigDst: func(_ net.Conn) (netip.AddrPort, error) {
+			return netip.MustParseAddrPort("192.168.0.21:22"), nil
+		},
+		Dial: func(_ context.Context, _ string) (net.Conn, error) {
+			return nil, errors.New("still sleeping")
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	c, err := net.Dial("tcp4", srv.ListenerAddrs()[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	time.Sleep(60 * time.Millisecond)
+	// TCP half-close (SHUT_WR -> FIN) while waiting for wake
+	_ = c.(*net.TCPConn).CloseWrite()
+
+	deadline := time.Now().Add(600 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		srv.connsMu.Lock()
+		n := len(srv.conns)
+		w := srv.waitingTotal
+		srv.connsMu.Unlock()
+		if n == 0 && w == 0 {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("expected TCP half-close during wake-up to cancel waiting connection and release wake slot")
+}
+
+func TestConcurrentAcceptAndACLReload(t *testing.T) {
+	_, backendPort := startEchoBackend(t)
+
+	probeLn, _ := net.Listen("tcp4", "127.0.0.1:0")
+	proxyPort := probeLn.Addr().(*net.TCPAddr).Port
+	_ = probeLn.Close()
+
+	cfg := &config.Config{
+		LANInterface:      "eth0",
+		IngressInterfaces: []string{"wg0"},
+		ProxyPort:         proxyPort,
+		WakeTimeout:       config.Duration(2 * time.Second),
+		WakeCooldown:      config.Duration(500 * time.Millisecond),
+		PollInterval:      config.Duration(50 * time.Millisecond),
+		Clients: map[string]config.Client{
+			"laptop": {CIDR: "127.0.0.1/32"},
+		},
+		Profiles: map[string]config.Profile{
+			"rdp": {Port: 3389, Wake: config.WakeAuto},
+		},
+		Targets: []config.Target{
+			{
+				Name:     "pc1",
+				IP:       "192.168.0.21",
+				MAC:      "aa:bb:cc:dd:ee:01",
+				Profiles: []string{"rdp"},
+				Allow:    []string{"laptop"},
+			},
+		},
+	}
+
+	srv := NewServer(Options{
+		Interfaces: testProxyInterfaces(),
+		NFT:        &fakeNFT{},
+		WoLSender:  &fakeWoLSender{},
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OrigDst: func(_ net.Conn) (netip.AddrPort, error) {
+			return netip.MustParseAddrPort("192.168.0.21:3389"), nil
+		},
+		Dial: func(ctx context.Context, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", intToStr(backendPort)))
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	listenAddr := srv.ListenerAddrs()[0]
+	var openConnsMu sync.Mutex
+	var openConns []net.Conn
+	stopDialers := make(chan struct{})
+	var dialersWG sync.WaitGroup
+
+	for i := 0; i < 16; i++ {
+		dialersWG.Add(1)
+		go func() {
+			defer dialersWG.Done()
+			for {
+				select {
+				case <-stopDialers:
+					return
+				default:
+				}
+				c, err := net.DialTimeout("tcp4", listenAddr, 100*time.Millisecond)
+				if err == nil {
+					openConnsMu.Lock()
+					openConns = append(openConns, c)
+					openConnsMu.Unlock()
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}()
+	}
+
+	// Let concurrent connections flood in, then revoke ACL via Reload while dialers are still active!
+	time.Sleep(40 * time.Millisecond)
+	revokedCfg := cfg.Clone()
+	revokedCfg.Targets[0].Allow = []string{}
+	if err := srv.Reload(context.Background(), revokedCfg); err != nil {
+		t.Fatalf("Reload failed: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	close(stopDialers)
+	dialersWG.Wait()
+
+	defer func() {
+		openConnsMu.Lock()
+		for _, c := range openConns {
+			_ = c.Close()
+		}
+		openConnsMu.Unlock()
+	}()
+
+	// Every single tracked connection must have been rejected or evicted!
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		srv.connsMu.Lock()
+		remaining := len(srv.conns)
+		srv.connsMu.Unlock()
+		if remaining == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	srv.connsMu.Lock()
+	remaining := len(srv.conns)
+	srv.connsMu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("ACL reload race: %d unauthorized connections survived reload", remaining)
+	}
+}
+
+func TestWaitingConnectionLimitsAndMACChangeEviction(t *testing.T) {
+	probeLn, _ := net.Listen("tcp4", "127.0.0.1:0")
+	proxyPort := probeLn.Addr().(*net.TCPAddr).Port
+	_ = probeLn.Close()
+
+	cfg := &config.Config{
+		LANInterface:      "eth0",
+		IngressInterfaces: []string{"wg0"},
+		ProxyPort:         proxyPort,
+		WakeTimeout:       config.Duration(5 * time.Second),
+		WakeCooldown:      config.Duration(time.Second),
+		PollInterval:      config.Duration(100 * time.Millisecond),
+		Clients: map[string]config.Client{
+			"laptop": {CIDR: "127.0.0.1/32"},
+		},
+		Profiles: map[string]config.Profile{
+			"rdp": {Port: 3389, Wake: config.WakeAuto},
+		},
+		Targets: []config.Target{
+			{
+				Name:     "pc1",
+				IP:       "192.168.0.21",
+				MAC:      "aa:bb:cc:dd:ee:01",
+				Profiles: []string{"rdp"},
+				Allow:    []string{"laptop"},
+			},
+		},
+	}
+
+	srv := NewServer(Options{
+		Interfaces:          testProxyInterfaces(),
+		NFT:                 &fakeNFT{},
+		WoLSender:           &fakeWoLSender{},
+		MaxWaitingPerTarget: 2,
+		MaxWaitingGlobal:    4,
+		Logger:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OrigDst: func(_ net.Conn) (netip.AddrPort, error) {
+			return netip.MustParseAddrPort("192.168.0.21:3389"), nil
+		},
+		Dial: func(_ context.Context, _ string) (net.Conn, error) {
+			return nil, errors.New("sleeping")
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	addr := srv.ListenerAddrs()[0]
+	c1, err := net.Dial("tcp4", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	c2, err := net.Dial("tcp4", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	// Wait until both enter waiting state
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		srv.connsMu.Lock()
+		w := srv.waitingByTarget["pc1"]
+		srv.connsMu.Unlock()
+		if w == 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 3rd waiting connection to pc1 must be rejected immediately due to MaxWaitingPerTarget=2
+	c3, err := net.Dial("tcp4", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c3.Close()
+	_ = c3.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+	if _, err := c3.Read(make([]byte, 4)); err == nil {
+		t.Fatal("expected 3rd waiting connection exceeding MaxWaitingPerTarget=2 to be closed")
+	}
+
+	// Reload changing pc1's MAC while keeping name="pc1" -> must evict c1 and c2!
+	macChangedCfg := cfg.Clone()
+	macChangedCfg.Targets[0].MAC = "aa:bb:cc:dd:ee:99"
+	if err := srv.Reload(context.Background(), macChangedCfg); err != nil {
+		t.Fatalf("Reload failed: %v", err)
+	}
+	_ = c1.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+	if _, err := c1.Read(make([]byte, 4)); err == nil {
+		t.Fatal("expected waiting connection to old MAC to be evicted on reload")
+	}
+}

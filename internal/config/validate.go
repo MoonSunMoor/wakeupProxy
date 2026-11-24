@@ -259,6 +259,25 @@ func Validate(cfg *Config, ifaces netutil.Provider) ValidationErrorList {
 		}
 	}
 
+	// Collect local host IPv4 addresses across interfaces to prevent self-loop / address collisions.
+	localIPs := make(map[netip.Addr]string)
+	if allIfaces, err := ifaces.Interfaces(); err == nil {
+		for _, info := range allIfaces {
+			for _, addr := range info.IPv4Addrs() {
+				if _, exists := localIPs[addr]; !exists {
+					localIPs[addr] = info.Name
+				}
+			}
+		}
+	}
+	if hasLANInfo {
+		for _, addr := range lanInfo.IPv4Addrs() {
+			if _, exists := localIPs[addr]; !exists {
+				localIPs[addr] = lanInfo.Name
+			}
+		}
+	}
+
 	// 4. Targets
 	seenTargetNames := make(map[string]bool, len(cfg.Targets))
 	type addrOwner struct {
@@ -304,6 +323,30 @@ func Validate(cfg *Config, ifaces netutil.Provider) ValidationErrorList {
 			} else {
 				seenAddrs[ipAddr] = addrOwner{targetName: tName, kind: "IP"}
 			}
+			if ownerIf, isLocal := localIPs[ipAddr]; isLocal {
+				errs = append(errs, ValidationError{
+					Section:  SectionTarget,
+					ItemName: tName,
+					Field:    "ip",
+					Message:  fmt.Sprintf("타깃 IP(%s)가 호스트 인터페이스(%s)의 로컬 주소와 충돌합니다", ipAddr, ownerIf),
+				})
+			} else if hasLANInfo {
+				if !lanInfo.ContainsIPv4(ipAddr) {
+					errs = append(errs, ValidationError{
+						Section:  SectionTarget,
+						ItemName: tName,
+						Field:    "ip",
+						Message:  fmt.Sprintf("타깃 IP(%s)가 LAN 인터페이스(%s) 서브넷 대역에 속하지 않습니다", ipAddr, cfg.LANInterface),
+					})
+				} else if reservedDesc, reserved := isLANReservedAddr(lanInfo, ipAddr); reserved {
+					errs = append(errs, ValidationError{
+						Section:  SectionTarget,
+						ItemName: tName,
+						Field:    "ip",
+						Message:  fmt.Sprintf("타깃 IP(%s)는 LAN 인터페이스(%s)의 %s이므로 사용할 수 없습니다", ipAddr, cfg.LANInterface, reservedDesc),
+					})
+				}
+			}
 		}
 
 		if strings.TrimSpace(t.Alias) != "" {
@@ -326,7 +369,14 @@ func Validate(cfg *Config, ifaces netutil.Provider) ValidationErrorList {
 				} else {
 					seenAddrs[aliasAddr] = addrOwner{targetName: tName, kind: "별칭"}
 				}
-				if hasLANInfo && lanInfo.ContainsIPv4(aliasAddr) {
+				if ownerIf, isLocal := localIPs[aliasAddr]; isLocal {
+					errs = append(errs, ValidationError{
+						Section:  SectionTarget,
+						ItemName: tName,
+						Field:    "alias",
+						Message:  fmt.Sprintf("별칭(%s)이 호스트 인터페이스(%s)의 로컬 주소와 충돌합니다", aliasAddr, ownerIf),
+					})
+				} else if hasLANInfo && lanInfo.ContainsIPv4(aliasAddr) {
 					errs = append(errs, ValidationError{
 						Section:  SectionTarget,
 						ItemName: tName,
@@ -407,4 +457,19 @@ func Validate(cfg *Config, ifaces netutil.Provider) ValidationErrorList {
 	}
 
 	return errs
+}
+
+func isLANReservedAddr(lanInfo netutil.InterfaceInfo, ip netip.Addr) (string, bool) {
+	for _, p := range lanInfo.Prefixes {
+		if !p.Addr().Is4() || p.Bits() >= 31 {
+			continue
+		}
+		if ip == p.Masked().Addr() {
+			return "서브넷 네트워크 주소", true
+		}
+		if bcast, err := netutil.BroadcastAddr(p); err == nil && ip == bcast {
+			return "서브넷 브로드캐스트 주소", true
+		}
+	}
+	return "", false
 }

@@ -24,6 +24,25 @@ func DefaultDialFunc(ctx context.Context, addr string) (net.Conn, error) {
 	return d.DialContext(ctx, "tcp4", addr)
 }
 
+// NewLANDialer returns a DialFunc that binds outbound TCP connections to localIP
+// so targets always observe the homeserver's LAN IPv4 address as the source.
+func NewLANDialer(localIP netip.Addr) DialFunc {
+	if !localIP.IsValid() || !localIP.Is4() {
+		return DefaultDialFunc
+	}
+	localTCP := &net.TCPAddr{
+		IP:   net.IP(localIP.AsSlice()),
+		Port: 0,
+	}
+	return func(ctx context.Context, addr string) (net.Conn, error) {
+		d := net.Dialer{
+			LocalAddr: localTCP,
+			KeepAlive: 30 * time.Second,
+		}
+		return d.DialContext(ctx, "tcp4", addr)
+	}
+}
+
 // WakeRequest describes a target and TCP port to wake and wait for.
 type WakeRequest struct {
 	TargetName    string
@@ -48,10 +67,19 @@ type portWakeCall struct {
 	waiters   int
 	startedAt time.Time
 
-	firstMu   sync.Mutex
+	// Protected by Coordinator.mu so waiter cancellation and poll completion
+	// synchronize atomically and never leak an unclaimed connection.
 	firstConn net.Conn
 	err       error
 	elapsed   time.Duration
+}
+
+func makeBeaconKey(req WakeRequest) string {
+	return fmt.Sprintf("%s|%s|%s|%s", req.TargetName, req.TargetIP.String(), req.MAC.String(), req.BroadcastAddr.String())
+}
+
+func makeCallKey(req WakeRequest) string {
+	return fmt.Sprintf("%s|%s|%s|%s|%d", req.TargetName, req.TargetIP.String(), req.MAC.String(), req.BroadcastAddr.String(), req.Port)
 }
 
 // Coordinator deduplicates Wake-on-LAN magic packet streams per target and
@@ -87,8 +115,8 @@ func NewCoordinator(sender Sender, dial DialFunc, logger *slog.Logger) *Coordina
 	}
 }
 
-func (c *Coordinator) acquireBeaconLocked(req WakeRequest) {
-	if b, ok := c.beacons[req.TargetName]; ok {
+func (c *Coordinator) acquireBeaconLocked(bKey string, req WakeRequest) {
+	if b, ok := c.beacons[bKey]; ok {
 		b.waiters++
 		return
 	}
@@ -97,20 +125,20 @@ func (c *Coordinator) acquireBeaconLocked(req WakeRequest) {
 		cancel:  cancel,
 		waiters: 1,
 	}
-	c.beacons[req.TargetName] = b
+	c.beacons[bKey] = b
 
 	macCopy := append(net.HardwareAddr(nil), req.MAC...)
 	go c.runBeacon(ctx, req.TargetName, req.BroadcastAddr, macCopy, req.WakeCooldown)
 }
 
-func (c *Coordinator) releaseBeaconLocked(targetName string) {
-	b, ok := c.beacons[targetName]
+func (c *Coordinator) releaseBeaconLocked(bKey string) {
+	b, ok := c.beacons[bKey]
 	if !ok {
 		return
 	}
 	b.waiters--
 	if b.waiters <= 0 {
-		delete(c.beacons, targetName)
+		delete(c.beacons, bKey)
 		b.cancel()
 	}
 }
@@ -171,10 +199,11 @@ func (c *Coordinator) WaitAndDial(ctx context.Context, req WakeRequest) (net.Con
 		req.WakeCooldown = 10 * time.Second
 	}
 
-	callKey := fmt.Sprintf("%s:%d", req.TargetName, req.Port)
+	bKey := makeBeaconKey(req)
+	callKey := makeCallKey(req)
 
 	c.mu.Lock()
-	c.acquireBeaconLocked(req)
+	c.acquireBeaconLocked(bKey, req)
 	call, exists := c.calls[callKey]
 	if exists {
 		call.waiters++
@@ -193,50 +222,49 @@ func (c *Coordinator) WaitAndDial(ctx context.Context, req WakeRequest) (net.Con
 
 	joinedAt := time.Now()
 	defer func() {
+		var orphan net.Conn
 		c.mu.Lock()
-		c.releaseBeaconLocked(req.TargetName)
-		if current, ok := c.calls[callKey]; ok && current == call {
-			call.waiters--
-			if call.waiters <= 0 {
-				delete(c.calls, callKey)
-				call.cancel()
-			}
-		} else {
-			call.waiters--
-			if call.waiters <= 0 {
-				call.cancel()
-			}
-		}
-		// If the poll succeeded right as the last waiter cancelled, ensure any unclaimed conn is closed.
+		c.releaseBeaconLocked(bKey)
+		call.waiters--
 		if call.waiters <= 0 {
-			call.firstMu.Lock()
+			if current, ok := c.calls[callKey]; ok && current == call {
+				delete(c.calls, callKey)
+			}
+			call.cancel()
 			if call.firstConn != nil {
-				_ = call.firstConn.Close()
+				orphan = call.firstConn
 				call.firstConn = nil
 			}
-			call.firstMu.Unlock()
 		}
 		c.mu.Unlock()
+		if orphan != nil {
+			_ = orphan.Close()
+		}
 	}()
 
 	select {
 	case <-ctx.Done():
 		return nil, time.Since(joinedAt), ctx.Err()
 	case <-call.done:
-		if call.err != nil {
-			return nil, time.Since(joinedAt), call.err
+		c.mu.Lock()
+		callErr := call.err
+		var claimed net.Conn
+		if callErr == nil && ctx.Err() == nil && call.firstConn != nil {
+			claimed = call.firstConn
+			call.firstConn = nil
 		}
-		// Claim the connection already established by the poll if available.
-		call.firstMu.Lock()
-		claimed := call.firstConn
-		call.firstConn = nil
-		call.firstMu.Unlock()
-		if claimed != nil {
-			// Re-check caller ctx in case both became ready simultaneously.
-			if ctx.Err() != nil {
+		c.mu.Unlock()
+
+		if callErr != nil {
+			return nil, time.Since(joinedAt), callErr
+		}
+		if ctx.Err() != nil {
+			if claimed != nil {
 				_ = claimed.Close()
-				return nil, time.Since(joinedAt), ctx.Err()
 			}
+			return nil, time.Since(joinedAt), ctx.Err()
+		}
+		if claimed != nil {
 			return claimed, time.Since(joinedAt), nil
 		}
 
@@ -251,11 +279,19 @@ func (c *Coordinator) WaitAndDial(ctx context.Context, req WakeRequest) (net.Con
 
 func (c *Coordinator) runPortPoll(ctx context.Context, callKey string, call *portWakeCall, req WakeRequest) {
 	defer func() {
+		var orphan net.Conn
 		c.mu.Lock()
 		if current, ok := c.calls[callKey]; ok && current == call {
 			delete(c.calls, callKey)
 		}
+		if call.waiters <= 0 && call.firstConn != nil {
+			orphan = call.firstConn
+			call.firstConn = nil
+		}
 		c.mu.Unlock()
+		if orphan != nil {
+			_ = orphan.Close()
+		}
 		call.cancel()
 		close(call.done)
 	}()
@@ -268,17 +304,22 @@ func (c *Coordinator) runPortPoll(ctx context.Context, callKey string, call *por
 		select {
 		case <-ctx.Done():
 			elapsed := time.Since(call.startedAt)
+			isTimeout := errors.Is(ctx.Err(), context.DeadlineExceeded)
+			c.mu.Lock()
 			call.elapsed = elapsed
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			if isTimeout {
 				call.err = ErrWakeTimeout
+			} else if call.err == nil {
+				call.err = ctx.Err()
+			}
+			c.mu.Unlock()
+			if isTimeout {
 				c.logger.Warn("타깃 깨우기 타임아웃",
 					"target", req.TargetName,
 					"ip", req.TargetIP.String(),
 					"port", req.Port,
 					"wait_duration", elapsed.Round(time.Millisecond),
 				)
-			} else {
-				call.err = ctx.Err()
 			}
 			return
 		case <-ticker.C:
@@ -287,10 +328,22 @@ func (c *Coordinator) runPortPoll(ctx context.Context, callKey string, call *por
 			cancel()
 			if err == nil {
 				elapsed := time.Since(call.startedAt)
+				c.mu.Lock()
+				if call.waiters <= 0 || ctx.Err() != nil {
+					if call.err == nil {
+						if ctx.Err() != nil {
+							call.err = ctx.Err()
+						} else {
+							call.err = context.Canceled
+						}
+					}
+					c.mu.Unlock()
+					_ = conn.Close()
+					return
+				}
 				call.elapsed = elapsed
-				call.firstMu.Lock()
 				call.firstConn = conn
-				call.firstMu.Unlock()
+				c.mu.Unlock()
 				c.logger.Info("타깃 깨우기 완료",
 					"target", req.TargetName,
 					"ip", req.TargetIP.String(),
