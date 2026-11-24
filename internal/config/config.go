@@ -223,7 +223,7 @@ func (c *Config) Clone() *Config {
 	return out
 }
 
-// ParseBytes parses YAML bytes into Config (applying timing defaults when omitted)
+// ParseBytes parses YAML bytes into Config (applying proxy_port and timing defaults when omitted)
 // and detects whether any non-header user comments were present.
 func ParseBytes(data []byte) (*Config, bool, error) {
 	var docNode yaml.Node
@@ -233,6 +233,7 @@ func ParseBytes(data []byte) (*Config, bool, error) {
 	hasComments := detectNonHeaderComments(&docNode)
 
 	cfg := &Config{
+		ProxyPort:    DefaultProxyPort,
 		WakeTimeout:  Duration(DefaultWakeTimeout),
 		WakeCooldown: Duration(DefaultWakeCooldown),
 		PollInterval: Duration(DefaultPollInterval),

@@ -162,8 +162,14 @@ func runCheck(cfgPath string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "설정 읽기 실패 (%s): %v\n", cfgPath, err)
 		return 1
 	}
-	if errs := config.Validate(cfg, netutil.SystemProvider{}); len(errs) > 0 {
-		fmt.Fprintf(stderr, "설정 검증 실패 (%d건):\n%s\n", len(errs), errs.Error())
+	rep := config.ValidateWithOptions(cfg, netutil.SystemProvider{}, config.ValidateOptions{
+		StrictInterfaces: false,
+	})
+	for _, w := range rep.Warnings {
+		fmt.Fprintf(stderr, "경고: %s\n", w.Error())
+	}
+	if len(rep.Errors) > 0 {
+		fmt.Fprintf(stderr, "설정 검증 실패 (%d건):\n%s\n", len(rep.Errors), rep.Errors.Error())
 		return 1
 	}
 	return 0

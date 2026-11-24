@@ -76,6 +76,7 @@ type compiledState struct {
 	cfg               *config.Config
 	lanInterface      string
 	lanSourceIP       netip.Addr
+	lanBroadcast      netip.Addr
 	ingressInterfaces []string
 	proxyPort         int
 	wakeTimeout       time.Duration
@@ -87,45 +88,51 @@ type compiledState struct {
 func compileState(
 	cfg *config.Config,
 	ifaces netutil.Provider,
-	fixedLAN string,
-	fixedIngress []string,
-	fixedProxyPort int,
-) (*compiledState, error) {
-	if errs := config.Validate(cfg, ifaces); len(errs) > 0 {
-		return nil, errs
+	strictInterfaces bool,
+	prev *compiledState,
+) (*compiledState, config.ValidationErrorList, error) {
+	rep := config.ValidateWithOptions(cfg, ifaces, config.ValidateOptions{
+		StrictInterfaces: strictInterfaces,
+	})
+	if len(rep.Errors) > 0 {
+		return nil, rep.Warnings, rep.Errors
 	}
 
 	lanName := cfg.LANInterface
-	if fixedLAN != "" {
-		lanName = fixedLAN
-	}
 	ingNames := cfg.IngressInterfaces
-	if len(fixedIngress) > 0 {
-		ingNames = fixedIngress
-	}
 	proxyPort := cfg.ProxyPort
-	if fixedProxyPort > 0 {
-		proxyPort = fixedProxyPort
+	if prev != nil {
+		lanName = prev.lanInterface
+		ingNames = prev.ingressInterfaces
+		proxyPort = prev.proxyPort
 	}
 
-	lanInfo, err := ifaces.InterfaceByName(lanName)
-	if err != nil {
-		return nil, err
+	var lanSourceIP netip.Addr
+	var bcast netip.Addr
+	if lanInfo, err := ifaces.InterfaceByName(lanName); err == nil {
+		if lanPrefix, ok := lanInfo.PrimaryPrefix(); ok {
+			bAddr, bErr := netutil.BroadcastAddr(lanPrefix)
+			if bErr != nil {
+				return nil, rep.Warnings, bErr
+			}
+			lanSourceIP = lanPrefix.Addr()
+			bcast = bAddr
+		}
 	}
-	lanPrefix, ok := lanInfo.PrimaryPrefix()
-	if !ok {
-		return nil, fmt.Errorf("LAN 인터페이스(%s)에 IPv4 서브넷이 없습니다", lanName)
-	}
-	bcast, err := netutil.BroadcastAddr(lanPrefix)
-	if err != nil {
-		return nil, err
+	if !bcast.IsValid() {
+		if prev != nil && prev.lanBroadcast.IsValid() {
+			lanSourceIP = prev.lanSourceIP
+			bcast = prev.lanBroadcast
+		} else {
+			return nil, rep.Warnings, fmt.Errorf("LAN 인터페이스(%s)에 IPv4 서브넷이 없습니다", lanName)
+		}
 	}
 
 	compiledClients := make(map[string]compiledClient, len(cfg.Clients))
 	for name, cl := range cfg.Clients {
 		pfx, err := netutil.ParseIPv4OrCIDR(cl.CIDR)
 		if err != nil {
-			return nil, err
+			return nil, rep.Warnings, err
 		}
 		compiledClients[name] = compiledClient{name: name, prefix: pfx}
 	}
@@ -134,18 +141,18 @@ func compileState(
 	for _, t := range cfg.Targets {
 		tIP, err := netutil.ParseIPv4Host(t.IP)
 		if err != nil {
-			return nil, err
+			return nil, rep.Warnings, err
 		}
 		_, macHW, err := netutil.NormalizeMAC(t.MAC)
 		if err != nil {
-			return nil, err
+			return nil, rep.Warnings, err
 		}
 		var aliasIP netip.Addr
 		hasAlias := strings.TrimSpace(t.Alias) != ""
 		if hasAlias {
 			aliasIP, err = netutil.ParseIPv4Host(t.Alias)
 			if err != nil {
-				return nil, err
+				return nil, rep.Warnings, err
 			}
 		}
 
@@ -188,14 +195,15 @@ func compileState(
 	return &compiledState{
 		cfg:               cfg.Clone(),
 		lanInterface:      lanName,
-		lanSourceIP:       lanPrefix.Addr(),
+		lanSourceIP:       lanSourceIP,
+		lanBroadcast:      bcast,
 		ingressInterfaces: append([]string(nil), ingNames...),
 		proxyPort:         proxyPort,
 		wakeTimeout:       cfg.WakeTimeout.Std(),
 		wakeCooldown:      cfg.WakeCooldown.Std(),
 		pollInterval:      cfg.PollInterval.Std(),
 		routes:            routes,
-	}, nil
+	}, rep.Warnings, nil
 }
 
 type trackedConn struct {
@@ -261,6 +269,11 @@ type Options struct {
 	MaxWaitingPerTarget int
 }
 
+type boundListener struct {
+	ln    net.Listener
+	iface string
+}
+
 // Server is the TCP Wake-on-LAN transparent proxy daemon.
 type Server struct {
 	opts       Options
@@ -269,7 +282,7 @@ type Server struct {
 	nextConnID atomic.Uint64
 
 	listenersMu     sync.Mutex
-	listenersByAddr map[string]net.Listener
+	listenersByAddr map[string]boundListener
 	stopSweeper     context.CancelFunc
 
 	reloadMu sync.Mutex
@@ -323,7 +336,7 @@ func NewServer(opts Options) *Server {
 	srv := &Server{
 		opts:            opts,
 		customDial:      customDial,
-		listenersByAddr: make(map[string]net.Listener),
+		listenersByAddr: make(map[string]boundListener),
 		conns:           make(map[uint64]*trackedConn),
 		waitingByTarget: make(map[string]int),
 	}
@@ -344,37 +357,51 @@ func (s *Server) dialUpstream(ctx context.Context, addr string) (net.Conn, error
 	return wol.NewLANDialer(lanIP)(ctx, addr)
 }
 
-func (s *Server) resolveIngressListenAddrs(ingNames []string, proxyPort int) ([]string, error) {
-	var listenAddrs []string
-	seenAddr := make(map[netip.AddrPort]bool)
+func (s *Server) syncIngressListeners(ctx context.Context, ingNames []string, proxyPort int, strict bool, startAccept bool) ([]net.Listener, error) {
+	var orderedAddrs []string
+	desiredOwner := make(map[string]string)
+	missingIfaces := make(map[string]bool)
+
 	for _, ifName := range ingNames {
 		info, err := s.opts.Interfaces.InterfaceByName(ifName)
 		if err != nil {
-			return nil, err
+			if strict {
+				return nil, err
+			}
+			missingIfaces[ifName] = true
+			s.opts.Logger.Warn("유입 인터페이스를 찾을 수 없어 기존 리스너를 유지합니다",
+				"interface", ifName,
+				"error", err,
+			)
+			continue
 		}
-		for _, ip := range info.IPv4Addrs() {
-			ap := netip.AddrPortFrom(ip, uint16(proxyPort))
-			if !seenAddr[ap] {
-				seenAddr[ap] = true
-				listenAddrs = append(listenAddrs, ap.String())
+		ipAddrs := info.IPv4Addrs()
+		if len(ipAddrs) == 0 {
+			if strict {
+				return nil, fmt.Errorf("유입 인터페이스(%s)에 IPv4 주소가 없습니다", ifName)
+			}
+			missingIfaces[ifName] = true
+			s.opts.Logger.Warn("유입 인터페이스에 IPv4 주소가 없어 기존 리스너를 유지합니다",
+				"interface", ifName,
+			)
+			continue
+		}
+		for _, ip := range ipAddrs {
+			addrStr := netip.AddrPortFrom(ip, uint16(proxyPort)).String()
+			if _, seen := desiredOwner[addrStr]; !seen {
+				desiredOwner[addrStr] = ifName
+				orderedAddrs = append(orderedAddrs, addrStr)
 			}
 		}
 	}
-	if len(listenAddrs) == 0 {
-		return nil, errors.New("바인드할 유입 인터페이스 IPv4 주소가 없습니다")
-	}
-	return listenAddrs, nil
-}
 
-func (s *Server) syncListeners(ctx context.Context, desiredAddrs []string, startAccept bool) ([]net.Listener, error) {
-	desiredSet := make(map[string]bool, len(desiredAddrs))
-	for _, a := range desiredAddrs {
-		desiredSet[a] = true
+	if strict && len(orderedAddrs) == 0 {
+		return nil, errors.New("바인드할 유입 인터페이스 IPv4 주소가 없습니다")
 	}
 
 	s.listenersMu.Lock()
 	var toBind []string
-	for _, a := range desiredAddrs {
+	for _, a := range orderedAddrs {
 		if _, exists := s.listenersByAddr[a]; !exists {
 			toBind = append(toBind, a)
 		}
@@ -397,16 +424,21 @@ func (s *Server) syncListeners(ctx context.Context, desiredAddrs []string, start
 	var startList []net.Listener
 
 	s.listenersMu.Lock()
-	for addr, ln := range newlyBound {
-		s.listenersByAddr[addr] = ln
-		if startAccept {
-			startList = append(startList, ln)
+	for _, addr := range orderedAddrs {
+		if ln, isNew := newlyBound[addr]; isNew {
+			s.listenersByAddr[addr] = boundListener{ln: ln, iface: desiredOwner[addr]}
+			if startAccept {
+				startList = append(startList, ln)
+			}
+		} else if existing, ok := s.listenersByAddr[addr]; ok {
+			existing.iface = desiredOwner[addr]
+			s.listenersByAddr[addr] = existing
 		}
 	}
-	for addr, ln := range s.listenersByAddr {
-		if !desiredSet[addr] {
+	for addr, bl := range s.listenersByAddr {
+		if _, wanted := desiredOwner[addr]; !wanted && !missingIfaces[bl.iface] {
 			delete(s.listenersByAddr, addr)
-			stale = append(stale, ln)
+			stale = append(stale, bl.ln)
 		}
 	}
 	s.listenersMu.Unlock()
@@ -433,25 +465,20 @@ func (s *Server) syncListeners(ctx context.Context, desiredAddrs []string, start
 // Start loads and validates the initial configuration, binds ingress listeners with
 // IP_FREEBIND, installs the atomic nftables ruleset, and starts accepting connections.
 func (s *Server) Start(ctx context.Context, cfg *config.Config) error {
-	st, err := compileState(cfg, s.opts.Interfaces, "", nil, 0)
+	st, _, err := compileState(cfg, s.opts.Interfaces, true, nil)
 	if err != nil {
 		return err
 	}
 
-	listenAddrs, err := s.resolveIngressListenAddrs(st.ingressInterfaces, st.proxyPort)
-	if err != nil {
-		return err
-	}
-
-	bound, err := s.syncListeners(ctx, listenAddrs, false)
+	bound, err := s.syncIngressListeners(ctx, st.ingressInterfaces, st.proxyPort, true, false)
 	if err != nil {
 		return err
 	}
 
 	closeBound := func() {
 		s.listenersMu.Lock()
-		for k, ln := range s.listenersByAddr {
-			_ = ln.Close()
+		for k, bl := range s.listenersByAddr {
+			_ = bl.ln.Close()
 			delete(s.listenersByAddr, k)
 		}
 		s.listenersMu.Unlock()
@@ -473,7 +500,7 @@ func (s *Server) Start(ctx context.Context, cfg *config.Config) error {
 	s.connsMu.Unlock()
 
 	s.opts.Logger.Info("wolproxy 데몬 시작",
-		"listen", listenAddrs,
+		"listen", s.ListenerAddrs(),
 		"lan_interface", st.lanInterface,
 		"lan_source_ip", st.lanSourceIP.String(),
 		"ingress_interfaces", st.ingressInterfaces,
@@ -508,8 +535,8 @@ func (s *Server) ListenerAddrs() []string {
 	s.listenersMu.Lock()
 	defer s.listenersMu.Unlock()
 	out := make([]string, 0, len(s.listenersByAddr))
-	for _, ln := range s.listenersByAddr {
-		out = append(out, ln.Addr().String())
+	for _, bl := range s.listenersByAddr {
+		out = append(out, bl.ln.Addr().String())
 	}
 	sort.Strings(out)
 	return out
@@ -547,8 +574,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	s.listenersMu.Lock()
 	lns := make([]net.Listener, 0, len(s.listenersByAddr))
-	for k, ln := range s.listenersByAddr {
-		lns = append(lns, ln)
+	for k, bl := range s.listenersByAddr {
+		lns = append(lns, bl.ln)
 		delete(s.listenersByAddr, k)
 	}
 	stopSweep := s.stopSweeper
@@ -606,7 +633,10 @@ func (s *Server) Reload(ctx context.Context, newCfg *config.Config) error {
 		return errors.New("서버가 실행 중이 아닙니다")
 	}
 
-	next, err := compileState(newCfg, s.opts.Interfaces, cur.lanInterface, cur.ingressInterfaces, cur.proxyPort)
+	next, warns, err := compileState(newCfg, s.opts.Interfaces, false, cur)
+	for _, w := range warns {
+		s.opts.Logger.Warn("설정 재적재 검증 경고", "detail", w.Error())
+	}
 	if err != nil {
 		s.opts.Logger.Error("설정 재적재 실패 (기존 설정 유지)", "error", err)
 		return err
@@ -625,13 +655,9 @@ func (s *Server) Reload(ctx context.Context, newCfg *config.Config) error {
 		)
 	}
 
-	// Re-sync ingress IPv4 listeners in case an ingress interface changed its IPv4 address.
-	desiredAddrs, err := s.resolveIngressListenAddrs(next.ingressInterfaces, next.proxyPort)
-	if err != nil {
-		s.opts.Logger.Error("설정 재적재 유입 주소 확인 실패 (기존 설정 유지)", "error", err)
-		return err
-	}
-	if _, err := s.syncListeners(ctx, desiredAddrs, true); err != nil {
+	// Re-sync ingress IPv4 listeners in case an ingress interface changed its IPv4 address;
+	// if an ingress interface is temporarily absent (e.g. wg-quick down), log a warning and keep existing listeners.
+	if _, err := s.syncIngressListeners(ctx, next.ingressInterfaces, next.proxyPort, false, true); err != nil {
 		s.opts.Logger.Error("설정 재적재 리스너 동기화 실패 (기존 설정 유지)", "error", err)
 		return err
 	}
@@ -910,9 +936,33 @@ func (s *Server) handleConn(clientConn net.Conn) {
 			return
 		}
 		if route.wake != config.WakeAuto {
-			s.logConnClosed(tc, 0, time.Since(startedAt), "wake_never")
+			reason := "wake_never"
+			if isConnRefused(dialErr) {
+				reason = "conn_refused"
+			}
+			s.logConnClosed(tc, 0, time.Since(startedAt), reason)
 			return
 		}
+
+		wakeReq := wol.WakeRequest{
+			TargetName:    route.targetName,
+			TargetIP:      route.targetIP,
+			MAC:           route.mac,
+			BroadcastAddr: route.broadcastAddr,
+			Port:          route.port,
+			WakeTimeout:   st.wakeTimeout,
+			WakeCooldown:  st.wakeCooldown,
+			PollInterval:  st.pollInterval,
+			DialTimeout:   initialDialTimeout,
+		}
+		// Only wake on timeout / EHOSTUNREACH / ENETUNREACH (or join if a wake for this target+port
+		// is already in progress). If the target responded with ECONNREFUSED and no wake is active,
+		// the host is already awake with the service closed, so close immediately without waking.
+		if !shouldWakeOnDialError(dialErr) && !s.coord.HasActiveWake(wakeReq) {
+			s.logConnClosed(tc, 0, time.Since(startedAt), tc.getReason(dialFailureReason(dialErr)))
+			return
+		}
+
 		if !s.acquireWakeSlot(route.targetName) {
 			s.opts.Logger.Warn("연결 거부: 깨우기 대기 연결 수 제한 초과",
 				"client_ip", clientIP.String(),
@@ -944,17 +994,7 @@ func (s *Server) handleConn(clientConn net.Conn) {
 				}
 			}()
 
-			wokenConn, _, wakeErr := s.coord.WaitAndDial(waitCtx, wol.WakeRequest{
-				TargetName:    route.targetName,
-				TargetIP:      route.targetIP,
-				MAC:           route.mac,
-				BroadcastAddr: route.broadcastAddr,
-				Port:          route.port,
-				WakeTimeout:   st.wakeTimeout,
-				WakeCooldown:  st.wakeCooldown,
-				PollInterval:  st.pollInterval,
-				DialTimeout:   initialDialTimeout,
-			})
+			wokenConn, _, wakeErr := s.coord.WaitAndDial(waitCtx, wakeReq)
 			watchCancel()
 			waitCancel()
 

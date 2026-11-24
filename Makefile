@@ -2,7 +2,7 @@ VERSION ?= 0.1.0
 ARCH ?= arm64
 OUT_DIR ?= dist
 
-.PHONY: all build build-arm64 test deb clean
+.PHONY: all build build-arm64 test bench deb clean
 
 all: test deb
 
@@ -19,11 +19,7 @@ bench:
 	go test -run=^$$ -bench=. -benchmem ./internal/proxy
 
 deb:
-	@if command -v dpkg-deb >/dev/null 2>&1; then \
-		sh packaging/build-deb.sh "$(VERSION)" "$(ARCH)" "$(OUT_DIR)"; \
-	else \
-		go run ./cmd/build-deb -version "$(VERSION)" -arch "$(ARCH)" -out "$(OUT_DIR)"; \
-	fi
+	sh packaging/build-deb.sh "$(VERSION)" "$(ARCH)" "$(OUT_DIR)"
 
 clean:
 	rm -rf $(OUT_DIR)

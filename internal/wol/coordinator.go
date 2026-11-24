@@ -183,6 +183,15 @@ func (c *Coordinator) runBeacon(ctx context.Context, targetName string, bcast ne
 	}
 }
 
+// HasActiveWake reports whether an in-flight wake/poll operation already exists for req.
+func (c *Coordinator) HasActiveWake(req WakeRequest) bool {
+	callKey := makeCallKey(req)
+	c.mu.Lock()
+	_, ok := c.calls[callKey]
+	c.mu.Unlock()
+	return ok
+}
+
 // WaitAndDial triggers (or joins) the in-flight wake operation for req.TargetName
 // and returns a connected TCP net.Conn to req.TargetIP:req.Port once it wakes up.
 func (c *Coordinator) WaitAndDial(ctx context.Context, req WakeRequest) (net.Conn, time.Duration, error) {

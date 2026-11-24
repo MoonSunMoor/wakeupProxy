@@ -160,6 +160,7 @@ type Model struct {
 	scanningLAN    bool
 	scanResults    []arp.DiscoveredHost
 	valErrors      config.ValidationErrorList
+	valWarnings    config.ValidationErrorList
 	pendingDiff    config.DiffResult
 	restartReasons []string
 

@@ -261,3 +261,54 @@ func TestSaveAtomicCheckedRejectsConcurrentExternalModification(t *testing.T) {
 		t.Fatalf("expected ErrExternalModification, got: %v", err)
 	}
 }
+
+func TestProxyPortDefaultAndMissingInterfaceWarnings(t *testing.T) {
+	// 1. Omitted proxy_port defaults to 13389; explicit proxy_port: 0 still fails validation
+	omittedPortYAML := `lan_interface: eth0
+ingress_interfaces: [wg0]
+clients:
+  laptop: { cidr: 10.66.0.2/32 }
+profiles:
+  ssh: { port: 22, wake: auto }
+targets: []
+`
+	cfg, _, err := ParseBytes([]byte(omittedPortYAML))
+	if err != nil {
+		t.Fatalf("ParseBytes failed: %v", err)
+	}
+	if cfg.ProxyPort != DefaultProxyPort {
+		t.Fatalf("expected omitted proxy_port to default to %d, got %d", DefaultProxyPort, cfg.ProxyPort)
+	}
+	if errs := Validate(cfg, testIfaces()); len(errs) != 0 {
+		t.Fatalf("expected omitted proxy_port config to validate cleanly, got: %v", errs)
+	}
+
+	zeroPortYAML := omittedPortYAML + "proxy_port: 0\n"
+	cfgZero, _, err := ParseBytes([]byte(zeroPortYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if errs := Validate(cfgZero, testIfaces()); len(errs) != 1 || errs[0].Field != "proxy_port" {
+		t.Fatalf("expected explicit proxy_port: 0 to fail validation, got: %v", errs)
+	}
+
+	// 2. Missing wg0 / eth0 is an error when StrictInterfaces=true, but only a warning when StrictInterfaces=false
+	onlyLAN := netutil.StaticProvider{
+		Items: []netutil.InterfaceInfo{
+			{
+				Name:     "eth0",
+				Index:    2,
+				Prefixes: []netip.Prefix{netip.MustParsePrefix("192.168.0.10/24")},
+				Up:       true,
+			},
+		},
+	}
+	strictRep := ValidateWithOptions(cfg, onlyLAN, ValidateOptions{StrictInterfaces: true})
+	if len(strictRep.Errors) != 1 || strictRep.Errors[0].Field != "ingress_interfaces" {
+		t.Fatalf("expected strict validation error for missing wg0, got: %+v", strictRep)
+	}
+	nonStrictRep := ValidateWithOptions(cfg, onlyLAN, ValidateOptions{StrictInterfaces: false})
+	if len(nonStrictRep.Errors) != 0 || len(nonStrictRep.Warnings) != 1 || nonStrictRep.Warnings[0].Field != "ingress_interfaces" {
+		t.Fatalf("expected non-strict validation to emit 0 errors and 1 warning for missing wg0, got: %+v", nonStrictRep)
+	}
+}

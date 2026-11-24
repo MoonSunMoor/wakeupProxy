@@ -397,3 +397,33 @@ func TestRunningDaemonStateDiffAndFailedReloadHandling(t *testing.T) {
 		t.Fatalf("expected proxy_port listed in restart confirmation:\n%s", m.View())
 	}
 }
+
+func TestSaveAllowsMissingIngressInterfaceWithWarning(t *testing.T) {
+	m, _, svc, _, _ := setupTestModel(t, true)
+	// Simulate wg0 down (only eth0 exists on system)
+	m.deps.Interfaces = netutil.StaticProvider{
+		Items: []netutil.InterfaceInfo{
+			{
+				Name:         "eth0",
+				Index:        2,
+				HardwareAddr: net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
+				Prefixes:     []netip.Prefix{netip.MustParsePrefix("192.168.0.10/24")},
+				Up:           true,
+			},
+		},
+	}
+
+	m, _ = sendKey(m, "s")
+	if m.screen != screenSaveSummary {
+		t.Fatalf("expected missing wg0 to proceed to screenSaveSummary with warning, got %v (errs=%v)", m.screen, m.valErrors)
+	}
+	if !strings.Contains(m.View(), "존재하지 않는 유입 인터페이스") {
+		t.Fatalf("expected missing ingress interface warning in save summary:\n%s", m.View())
+	}
+	m, cmd := sendKey(m, "y")
+	next, _ := m.Update(cmd())
+	m = next.(*Model)
+	if svc.reloads != 1 {
+		t.Fatalf("expected save+reload to succeed while wg0 is down, got reloads=%d", svc.reloads)
+	}
+}

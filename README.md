@@ -13,8 +13,8 @@ WireGuard VPN 등 신뢰된 유입 인터페이스로 들어오는 TCP 연결 �
   - 홈서버의 `ip_forward`나 기본 `forward` 체인을 건드리지 않고, 전용 `table inet wolproxy`만으로 지정된 `(타깃 IP·별칭, 프로파일 포트)`만 가로챕니다.
   - 데몬 시작 시 단일 트랜잭션(`nft -f -`)으로 규칙을 설치하고, 종료(`SIGTERM`) 시 깔끔하게 정리합니다.
 - **자동 깨우기 및 중복 송신 합치기 (`singleflight`)**
-  - 연결 수락 후 먼저 1초 타임아웃으로 타깃 접속을 시도하고, 응답이 없을 때만(`wake: auto`) 서브넷 브로드캐스트 UDP 9번으로 매직 패킷을 보냅니다.
-  - 포트가 열릴 때까지 `poll_interval`(기본 2초)마다 확인하고 `wake_cooldown`(기본 10초)마다 재송신합니다.
+  - 연결 수락 후 먼저 1초 타임아웃으로 타깃 접속을 시도합니다. 첫 접속이 `ECONNREFUSED`(타깃 PC는 켜져 있으나 서비스만 내려간 상태)이면 깨우지 않고 즉시 연결을 닫고, 타임아웃·`EHOSTUNREACH`·`ENETUNREACH`일 때만(`wake: auto`) 서브넷 브로드캐스트 UDP 9번으로 매직 패킷을 보냅니다.
+  - 포트가 열릴 때까지 `poll_interval`(기본 2초)마다 확인하고 `wake_cooldown`(기본 10초)마다 재송신합니다(깨우기 대기 중 폴링에서는 부팅 과도기의 `ECONNREFUSED`도 부팅 진행 중으로 보고 계속 대기합니다).
   - 같은 타깃에 여러 연결이 동시에 들어와도 깨우기 작업은 하나로 합쳐 진행하며, 대기 중 클라이언트가 연결을 끊으면 즉시 중단합니다.
 - **별칭(Alias) IP 지원**
   - 클라이언트 로컬 네트워크 대역과 집 LAN 대역이 겹칠 때 홈서버에 별도 주소를 추가하지 않고도 별칭 IP로 가로채 실제 타깃 IP로 중계합니다.
@@ -27,7 +27,7 @@ WireGuard VPN 등 신뢰된 유입 인터페이스로 들어오는 TCP 연결 �
 - **내장 TUI 설정 편집기 (Bubble Tea + Huh)**
   - `sudo wolproxy` 실행만으로 타깃·클라이언트·프로파일·전역 설정 편집, LAN ARP 기기 검색(`Ctrl+L`), MAC 자동 채우기, 검증 오류 위치 점프, 백업(`.bak`) 및 서비스 적용까지 한 번에 처리합니다.
 - **최소 권한 실행**
-  - 전용 시스템 사용자 `wolproxy`와 `CAP_NET_ADMIN`, `CAP_NET_BIND_SERVICE` 권한만으로 데몬이 동작하며, `wolproxy wake`는 일반 사용자 권한으로도 동작합니다.
+  - 전용 시스템 사용자 `wolproxy`와 `CAP_NET_ADMIN` 권한만으로 데몬이 동작하며, `wolproxy wake`는 일반 사용자 권한으로도 동작합니다.
 
 ---
 
@@ -45,13 +45,13 @@ flowchart LR
 ```mermaid
 flowchart LR
   A[연결 수락] --> B[타깃에 접속 시도 1초]
-  B --> C{응답?}
-  C -- 예 --> D[양방향 중계]
-  C -- 아니요 --> E["매직 패킷 송신<br/>(wake가 auto일 때)"]
+  B --> C{결과?}
+  C -- 성공 --> D[양방향 중계]
+  C -- "타임아웃 / Unreachable" --> E["매직 패킷 송신<br/>(wake가 auto일 때)"]
+  C -- "ECONNREFUSED / wake=never" --> G[연결 닫기]
   E --> F["포트 폴링<br/>(2초 확인 · 10초 재송신)"]
   F -- 포트 열림 --> D
-  F -- 시간 초과 --> G[연결 닫기]
-  E -- wake가 never --> G
+  F -- 시간 초과 --> G
   A -- 미등록 목적지 / 허용 목록 밖 --> G
 ```
 
@@ -63,19 +63,17 @@ flowchart LR
 
 - **운영체제**: Linux (Debian 12+ 권장, `arm64` / `amd64`), IPv4 전용
 - **런타임 패키지**: `nftables`, `systemd`, `adduser` (유입 망으로 `wireguard-tools` 권장)
-- **빌드 환경**: Go 1.22 이상 (`CGO_ENABLED=0` 순수 Go 정적 바이너리)
+- **빌드 환경**: Go 1.24 이상 (`CGO_ENABLED=0` 순수 Go 정적 바이너리), 패키지 생성 시 `dpkg-deb`
 
 ### `.deb` 패키지 빌드 및 설치 (Debian ARM64)
 
-Linux/Debian 환경에서는 표준 `dpkg-deb --root-owner-group`(`packaging/build-deb.sh`)을 우선 사용하며, `dpkg-deb`가 없는 Windows/macOS 개발 환경에서는 순수 Go 폴백 빌더(`cmd/build-deb`)로 동일 구조의 패키지를 생성할 수 있습니다.
+`dpkg-deb --root-owner-group`(`packaging/build-deb.sh`)을 사용해 Debian 패키지를 생성합니다.
 
 ```bash
-# Makefile 사용 (dpkg-deb 존재 시 표준 dpkg-deb 사용, 없을 시 cmd/build-deb 폴백)
+# wolproxy_0.1.0_arm64.deb 생성 (기본 출력 경로: dist/)
 make deb VERSION=0.1.0 ARCH=arm64
-
 # 또는 직접 실행:
 sh packaging/build-deb.sh 0.1.0 arm64 dist
-go run ./cmd/build-deb -version 0.1.0 -arch arm64 -out dist
 ```
 
 홈서버에서 패키지 설치:
@@ -163,7 +161,7 @@ targets:
 - **전역 설정**
   - `lan_interface`: 타깃 PC가 연결된 LAN 인터페이스 (업스트림 발신 IP 고정, 서브넷 브로드캐스트 계산 및 ARP 조회에 사용)
   - `ingress_interfaces`: 연결을 가로챌 유입 인터페이스 목록 (예: `[wg0]`). 각 인터페이스의 IPv4 주소에 `IP_FREEBIND`로 `proxy_port`를 바인드합니다.
-  - `proxy_port`: `nftables` 리다이렉트를 수신할 로컬 포트 (기본 `13389`)
+  - `proxy_port`: `nftables` 리다이렉트를 수신할 로컬 포트 (생략 가능, 기본 `13389`)
   - `wake_timeout` / `wake_cooldown` / `poll_interval`: 깨우기 최대 대기 시간(기본 `120s`), 매직 패킷 재송신 주기(기본 `10s`), 포트 열림 확인 주기(기본 `2s`)
     - **`wake_timeout` 기준**: 개별 클라이언트 연결마다 따로 시작되는 시간이 아니라, 해당 `(타깃, 포트)`에 대해 **공유된 깨우기 작업(`singleflight` 첫 매직 패킷 송신 및 폴링 시작 시점)** 기준으로 측정됩니다.
 - **`clients`**: 접속을 허용할 클라이언트 이름과 IPv4 주소/CIDR
@@ -182,9 +180,9 @@ targets:
 
 ### 검증 항목
 
-데몬 시작, `wolproxy check`, TUI 저장 시 모두 동일한 검증기를 실행합니다.
+데몬 시작, `wolproxy check`, 재적재(`reload`), TUI 저장 시 공통 검증기를 실행합니다.
 
-- 존재하지 않거나 IPv4가 없는 `lan_interface` / `ingress_interfaces`
+- 비어 있거나 중복된 `lan_interface` / `ingress_interfaces` (존재하지 않거나 IPv4가 없는 인터페이스는 `serve` 시작 시에만 오류로 처리되며, `wg-quick down` 등 운영 중 `check`·`reload`·TUI 저장에서는 경고만 표시하고 나머지 설정을 적용합니다)
 - `lan_interface` 서브넷 대역 밖의 타깃 `ip`, 서브넷 네트워크/브로드캐스트 주소, 또는 호스트 자신의 로컬 인터페이스 IP와 충돌하는 `ip` / `alias`
 - 중복된 타깃 이름·IP·별칭, 또는 LAN 인터페이스 서브넷과 겹치는 `alias`
 - 잘못된 IPv4/CIDR, 유효하지 않은 6바이트 MAC 주소, 포트 범위(`1~65535`) 이탈
@@ -257,8 +255,7 @@ sudo systemctl edit wolproxy
 ```text
 .
 ├── cmd/
-│   ├── wolproxy/       # CLI 진입점 (TUI, serve, reload, wake, check)
-│   └── build-deb/      # 크로스 플랫폼 폴백용 순수 Go Debian (.deb) 패키지 빌더
+│   └── wolproxy/       # CLI 진입점 (TUI, serve, reload, wake, check)
 ├── internal/
 │   ├── arp/            # Linux AF_PACKET raw ARP 스캔 및 Netlink 이웃 테이블 조회
 │   ├── config/         # YAML 파싱/직렬화, 주석 감지, 검증, 변경 요약(Diff), 디렉터리 fsync 원자적 저장

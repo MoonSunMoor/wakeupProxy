@@ -381,6 +381,14 @@ func (m *Model) renderSaveSummaryModal() string {
 		}
 	}
 
+	if len(m.valWarnings) > 0 {
+		b.WriteString("\n")
+		for _, w := range m.valWarnings {
+			b.WriteString(warnStyle.Render("⚠ 경고: " + w.Error()))
+			b.WriteByte('\n')
+		}
+	}
+
 	if m.meta.HasUserComments {
 		b.WriteString("\n")
 		b.WriteString(warnStyle.Render("⚠ 기존 파일에 머리말 밖 주석이 있습니다. 저장하면 주석이 사라집니다 (메모는 note 필드를 사용하세요)."))

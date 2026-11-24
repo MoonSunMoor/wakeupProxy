@@ -8,8 +8,10 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -281,7 +283,7 @@ func TestProxyWakePollPreservesInitialClientBytesAndIdleTimeout(t *testing.T) {
 		},
 		Dial: func(ctx context.Context, _ string) (net.Conn, error) {
 			if !awake.Load() {
-				return nil, errors.New("host sleeping")
+				return nil, context.DeadlineExceeded
 			}
 			var d net.Dialer
 			return d.DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", intToStr(backendPort)))
@@ -473,7 +475,7 @@ func TestClientDisconnectCancelsWakeWaitImmediately(t *testing.T) {
 			return netip.MustParseAddrPort("192.168.0.21:3389"), nil
 		},
 		Dial: func(_ context.Context, _ string) (net.Conn, error) {
-			return nil, errors.New("still sleeping")
+			return nil, context.DeadlineExceeded
 		},
 	})
 
@@ -554,7 +556,7 @@ func TestClientHalfCloseDuringWakeCancelsImmediately(t *testing.T) {
 			return netip.MustParseAddrPort("192.168.0.21:22"), nil
 		},
 		Dial: func(_ context.Context, _ string) (net.Conn, error) {
-			return nil, errors.New("still sleeping")
+			return nil, syscall.EHOSTUNREACH
 		},
 	})
 
@@ -746,7 +748,7 @@ func TestWaitingConnectionLimitsAndMACChangeEviction(t *testing.T) {
 			return netip.MustParseAddrPort("192.168.0.21:3389"), nil
 		},
 		Dial: func(_ context.Context, _ string) (net.Conn, error) {
-			return nil, errors.New("sleeping")
+			return nil, syscall.ENETUNREACH
 		},
 	})
 
@@ -801,5 +803,229 @@ func TestWaitingConnectionLimitsAndMACChangeEviction(t *testing.T) {
 	_ = c1.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
 	if _, err := c1.Read(make([]byte, 4)); err == nil {
 		t.Fatal("expected waiting connection to old MAC to be evicted on reload")
+	}
+}
+
+func TestInitialECONNREFUSEDClosesWithoutWakeWhilePollToleratesRefused(t *testing.T) {
+	_, backendPort := startEchoBackend(t)
+
+	// Closed local port guaranteed to return real OS ECONNREFUSED / WSAECONNREFUSED
+	closedLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedAddr := closedLn.Addr().String()
+	_ = closedLn.Close()
+
+	probeLn, _ := net.Listen("tcp4", "127.0.0.1:0")
+	proxyPort := probeLn.Addr().(*net.TCPAddr).Port
+	_ = probeLn.Close()
+
+	cfg := &config.Config{
+		LANInterface:      "eth0",
+		IngressInterfaces: []string{"wg0"},
+		ProxyPort:         proxyPort,
+		WakeTimeout:       config.Duration(3 * time.Second),
+		WakeCooldown:      config.Duration(time.Second),
+		PollInterval:      config.Duration(35 * time.Millisecond),
+		Clients:           map[string]config.Client{"laptop": {CIDR: "127.0.0.1/32"}},
+		Profiles:          map[string]config.Profile{"ssh": {Port: 22, Wake: config.WakeAuto}},
+		Targets: []config.Target{{
+			Name:     "pc1",
+			IP:       "192.168.0.21",
+			MAC:      "aa:bb:cc:dd:ee:01",
+			Profiles: []string{"ssh"},
+			Allow:    []string{"laptop"},
+		}},
+	}
+
+	// Phase: 0 = awake but service stopped (real ECONNREFUSED)
+	//        1 = sleeping (EHOSTUNREACH)
+	//        2 = booting (real ECONNREFUSED during poll)
+	//        3 = service ready (backend echo)
+	var phase atomic.Int32
+	wolMock := &fakeWoLSender{}
+
+	srv := NewServer(Options{
+		Interfaces: testProxyInterfaces(),
+		NFT:        &fakeNFT{},
+		WoLSender:  wolMock,
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OrigDst: func(_ net.Conn) (netip.AddrPort, error) {
+			return netip.MustParseAddrPort("192.168.0.21:22"), nil
+		},
+		Dial: func(ctx context.Context, _ string) (net.Conn, error) {
+			var d net.Dialer
+			switch phase.Load() {
+			case 0, 2:
+				return d.DialContext(ctx, "tcp4", closedAddr)
+			case 1:
+				return nil, syscall.EHOSTUNREACH
+			default:
+				return d.DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", intToStr(backendPort)))
+			}
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	// 1. Initial ECONNREFUSED (phase 0) -> closes immediately without sending magic packet!
+	t0 := time.Now()
+	cRefused, err := net.Dial("tcp4", srv.ListenerAddrs()[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = cRefused.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_, rErr := cRefused.Read(make([]byte, 4))
+	_ = cRefused.Close()
+	if rErr == nil {
+		t.Fatal("expected initial ECONNREFUSED connection to close immediately")
+	}
+	if elapsed := time.Since(t0); elapsed > 400*time.Millisecond {
+		t.Fatalf("initial ECONNREFUSED took too long to close: %v", elapsed)
+	}
+	if got := wolMock.packets.Load(); got != 0 {
+		t.Fatalf("expected 0 magic packets on initial ECONNREFUSED, got %d", got)
+	}
+
+	// 2. Sleeping (phase 1 -> EHOSTUNREACH) enters wake, transitions to booting (phase 2 -> ECONNREFUSED on poll),
+	//    and then ready (phase 3) -> succeeds!
+	phase.Store(1)
+	cWake, err := net.Dial("tcp4", srv.ListenerAddrs()[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cWake.Close()
+
+	time.Sleep(50 * time.Millisecond)
+	phase.Store(2) // Poll now hits real ECONNREFUSED while OS boots before sshd starts
+	time.Sleep(90 * time.Millisecond)
+	phase.Store(3) // sshd is now up!
+
+	msg := []byte("booted-ok")
+	if _, err := cWake.Write(msg); err != nil {
+		t.Fatalf("write after wake failed: %v", err)
+	}
+	got := make([]byte, len(msg))
+	_ = cWake.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := io.ReadFull(cWake, got); err != nil || !bytes.Equal(got, msg) {
+		t.Fatalf("expected relay after surviving ECONNREFUSED during poll, got %q err=%v", got, err)
+	}
+	if wolMock.packets.Load() < 1 {
+		t.Fatal("expected magic packet sent for EHOSTUNREACH wake")
+	}
+}
+
+type dynamicProvider struct {
+	mu    sync.Mutex
+	items []netutil.InterfaceInfo
+}
+
+func (p *dynamicProvider) Interfaces() ([]netutil.InterfaceInfo, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return netutil.StaticProvider{Items: p.items}.Interfaces()
+}
+
+func (p *dynamicProvider) InterfaceByName(name string) (netutil.InterfaceInfo, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return netutil.StaticProvider{Items: p.items}.InterfaceByName(name)
+}
+
+func TestReloadSucceedsAndKeepsListenerWhenIngressInterfaceMissing(t *testing.T) {
+	_, backendPort := startEchoBackend(t)
+
+	probeLn, _ := net.Listen("tcp4", "127.0.0.1:0")
+	proxyPort := probeLn.Addr().(*net.TCPAddr).Port
+	_ = probeLn.Close()
+
+	dynIfaces := &dynamicProvider{
+		items: testProxyInterfaces().Items,
+	}
+	nftMock := &fakeNFT{}
+
+	cfg := &config.Config{
+		LANInterface:      "eth0",
+		IngressInterfaces: []string{"wg0"},
+		ProxyPort:         proxyPort,
+		WakeTimeout:       config.Duration(2 * time.Second),
+		WakeCooldown:      config.Duration(time.Second),
+		PollInterval:      config.Duration(50 * time.Millisecond),
+		Clients:           map[string]config.Client{"laptop": {CIDR: "127.0.0.1/32"}},
+		Profiles:          map[string]config.Profile{"ssh": {Port: 22, Wake: config.WakeAuto}},
+		Targets: []config.Target{{
+			Name:     "pc1",
+			IP:       "192.168.0.21",
+			MAC:      "aa:bb:cc:dd:ee:01",
+			Profiles: []string{"ssh"},
+			Allow:    []string{"laptop"},
+		}},
+	}
+
+	srv := NewServer(Options{
+		Interfaces: dynIfaces,
+		NFT:        nftMock,
+		WoLSender:  &fakeWoLSender{},
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OrigDst: func(_ net.Conn) (netip.AddrPort, error) {
+			return netip.MustParseAddrPort("192.168.0.22:22"), nil
+		},
+		Dial: func(ctx context.Context, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", intToStr(backendPort)))
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	// Simulate `wg-quick down wg0`: remove wg0 from system interfaces!
+	dynIfaces.mu.Lock()
+	dynIfaces.items = []netutil.InterfaceInfo{dynIfaces.items[0]} // only eth0 remains
+	dynIfaces.mu.Unlock()
+
+	// Add pc2 and reload while wg0 is down -> must succeed with warning, update nft, and keep listener!
+	newCfg := cfg.Clone()
+	newCfg.Targets = append(newCfg.Targets, config.Target{
+		Name:     "pc2",
+		IP:       "192.168.0.22",
+		MAC:      "aa:bb:cc:dd:ee:02",
+		Profiles: []string{"ssh"},
+		Allow:    []string{"laptop"},
+	})
+	if err := srv.Reload(context.Background(), newCfg); err != nil {
+		t.Fatalf("expected Reload to succeed with warning when wg0 is down, got: %v", err)
+	}
+
+	nftMock.mu.Lock()
+	lastRuleset := nftMock.rulesets[len(nftMock.rulesets)-1]
+	nftMock.mu.Unlock()
+	if !strings.Contains(lastRuleset, "192.168.0.22 . 22") {
+		t.Fatalf("expected reloaded nft ruleset to include new target pc2:\n%s", lastRuleset)
+	}
+	if len(srv.ListenerAddrs()) != 1 {
+		t.Fatalf("expected existing wg0 listener preserved while wg0 is down, got %v", srv.ListenerAddrs())
+	}
+
+	// Verify preserved listener routes to newly added pc2 immediately when traffic arrives!
+	c, err := net.Dial("tcp4", srv.ListenerAddrs()[0])
+	if err != nil {
+		t.Fatalf("expected preserved listener to accept connection: %v", err)
+	}
+	defer c.Close()
+	_, _ = c.Write([]byte("wg-back"))
+	got := make([]byte, 7)
+	if _, err := io.ReadFull(c, got); err != nil || string(got) != "wg-back" {
+		t.Fatalf("expected echo from newly reloaded target pc2, got %q err=%v", got, err)
 	}
 }

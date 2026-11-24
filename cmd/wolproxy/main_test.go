@@ -61,6 +61,25 @@ targets: []
 		t.Fatalf("expected check -c <path> to exit 0, got %d (%s)", code, stderr.String())
 	}
 
+	// Missing interface (e.g. wg0 down) emits a warning and still exits 0 on check; omitted proxy_port defaults to 13389.
+	warnPath := filepath.Join(dir, "missing_wg0.yaml")
+	warnYAML := `lan_interface: ` + usable + `
+ingress_interfaces: [nonexistent_wg99]
+clients: {}
+profiles: {}
+targets: []
+`
+	if err := os.WriteFile(warnPath, []byte(warnYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stderr.Reset()
+	if code := run([]string{"-c", warnPath, "check"}, strings.NewReader(""), &stdout, &stderr, func() bool { return false }); code != 0 {
+		t.Fatalf("expected missing ingress interface on check to warn and exit 0, got %d (%s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "경고:") {
+		t.Fatalf("expected warning message on stderr for missing interface, got %q", stderr.String())
+	}
+
 	invalidPath := filepath.Join(dir, "invalid.yaml")
 	_ = os.WriteFile(invalidPath, []byte("lan_interface: nonexistent_iface_xyz\nproxy_port: 99999\n"), 0o644)
 	stderr.Reset()

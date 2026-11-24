@@ -71,16 +71,43 @@ func (list ValidationErrorList) Error() string {
 	return strings.Join(msgs, "\n")
 }
 
-// Validate checks the entire configuration using the exact rules shared by
-// wolproxy serve, wolproxy check, and the TUI save pipeline.
+// ValidateOptions controls context-sensitive validation rules.
+type ValidateOptions struct {
+	// StrictInterfaces treats missing or unaddressed LAN/ingress interfaces as errors
+	// (used on `wolproxy serve` startup). When false (`check`, reload, TUI save),
+	// missing or unaddressed interfaces are reported in Warnings instead of Errors.
+	StrictInterfaces bool
+}
+
+// ValidationReport separates blocking configuration errors from non-blocking warnings.
+type ValidationReport struct {
+	Errors   ValidationErrorList
+	Warnings ValidationErrorList
+}
+
+// Validate checks the entire configuration with StrictInterfaces enabled (`serve` startup rules).
 func Validate(cfg *Config, ifaces netutil.Provider) ValidationErrorList {
+	return ValidateWithOptions(cfg, ifaces, ValidateOptions{StrictInterfaces: true}).Errors
+}
+
+// ValidateWithOptions checks the configuration according to opts and returns both Errors and Warnings.
+func ValidateWithOptions(cfg *Config, ifaces netutil.Provider, opts ValidateOptions) ValidationReport {
 	var errs ValidationErrorList
+	var warns ValidationErrorList
+	addIfaceIssue := func(ve ValidationError) {
+		if opts.StrictInterfaces {
+			errs = append(errs, ve)
+		} else {
+			warns = append(warns, ve)
+		}
+	}
+
 	if cfg == nil {
 		errs = append(errs, ValidationError{
 			Section: SectionGlobal,
 			Message: "설정이 비어 있습니다",
 		})
-		return errs
+		return ValidationReport{Errors: errs}
 	}
 	if ifaces == nil {
 		ifaces = netutil.SystemProvider{}
@@ -98,13 +125,13 @@ func Validate(cfg *Config, ifaces netutil.Provider) ValidationErrorList {
 	} else {
 		info, err := ifaces.InterfaceByName(cfg.LANInterface)
 		if err != nil {
-			errs = append(errs, ValidationError{
+			addIfaceIssue(ValidationError{
 				Section: SectionGlobal,
 				Field:   "lan_interface",
 				Message: fmt.Sprintf("존재하지 않는 LAN 인터페이스입니다: %s", cfg.LANInterface),
 			})
 		} else if len(info.Prefixes) == 0 {
-			errs = append(errs, ValidationError{
+			addIfaceIssue(ValidationError{
 				Section: SectionGlobal,
 				Field:   "lan_interface",
 				Message: fmt.Sprintf("LAN 인터페이스(%s)에 IPv4 주소가 없습니다", cfg.LANInterface),
@@ -144,13 +171,13 @@ func Validate(cfg *Config, ifaces netutil.Provider) ValidationErrorList {
 			seenIface[name] = true
 			ingInfo, err := ifaces.InterfaceByName(name)
 			if err != nil {
-				errs = append(errs, ValidationError{
+				addIfaceIssue(ValidationError{
 					Section: SectionGlobal,
 					Field:   "ingress_interfaces",
 					Message: fmt.Sprintf("존재하지 않는 유입 인터페이스입니다: %s", name),
 				})
 			} else if len(ingInfo.Prefixes) == 0 {
-				errs = append(errs, ValidationError{
+				addIfaceIssue(ValidationError{
 					Section: SectionGlobal,
 					Field:   "ingress_interfaces",
 					Message: fmt.Sprintf("유입 인터페이스(%s)에 IPv4 주소가 없습니다", name),
@@ -456,7 +483,10 @@ func Validate(cfg *Config, ifaces netutil.Provider) ValidationErrorList {
 		}
 	}
 
-	return errs
+	return ValidationReport{
+		Errors:   errs,
+		Warnings: warns,
+	}
 }
 
 func isLANReservedAddr(lanInfo netutil.InterfaceInfo, ip netip.Addr) (string, bool) {

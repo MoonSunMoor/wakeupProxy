@@ -21,14 +21,19 @@ func (m *Model) startSaveFlow() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	errs := config.Validate(m.cfg, m.deps.Interfaces)
-	if len(errs) > 0 {
-		m.valErrors = errs
+	rep := config.ValidateWithOptions(m.cfg, m.deps.Interfaces, config.ValidateOptions{
+		StrictInterfaces: false,
+	})
+	if len(rep.Errors) > 0 {
+		m.valErrors = rep.Errors
+		m.valWarnings = nil
 		m.modalCursor = 0
 		m.screen = screenValidationErrors
 		return m, nil
 	}
 
+	m.valErrors = nil
+	m.valWarnings = rep.Warnings
 	m.pendingDiff = config.Diff(m.savedCfg, m.cfg)
 	m.screen = screenSaveSummary
 	return m, nil
