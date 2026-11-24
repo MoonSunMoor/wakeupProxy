@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+if [ -d /run/systemd/system ]; then
+    systemctl --system daemon-reload >/dev/null 2>&1 || true
+fi
+
+if [ "$1" = "purge" ]; then
+    if [ -d /run/systemd/system ]; then
+        systemctl disable wolproxy.service >/dev/null 2>&1 || true
+    fi
+    rm -f /etc/wolproxy/config.yaml.bak
+    rmdir --ignore-fail-on-non-empty /etc/wolproxy 2>/dev/null || true
+fi
+
+exit 0

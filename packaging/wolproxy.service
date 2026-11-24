@@ -1,0 +1,21 @@
+[Unit]
+Description=TCP Wake-on-LAN Transparent Proxy (wolproxy)
+Documentation=https://github.com/MoonSunMoor/wakeupProxy
+Wants=network-online.target
+After=network-online.target wg-quick@wg0.service
+
+[Service]
+Type=simple
+User=wolproxy
+Group=wolproxy
+ExecStart=/usr/bin/wolproxy serve
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStopPost=-/usr/sbin/nft delete table inet wolproxy
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=multi-user.target

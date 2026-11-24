@@ -1,0 +1,6 @@
+dist/
+*.deb
+*.exe
+*.test
+*.out
+coverage.txt

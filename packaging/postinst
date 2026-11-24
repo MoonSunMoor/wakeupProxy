@@ -1,0 +1,30 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    if ! getent passwd wolproxy >/dev/null 2>&1; then
+        if command -v adduser >/dev/null 2>&1; then
+            adduser --system --group --no-create-home --home /nonexistent --shell /usr/sbin/nologin wolproxy
+        else
+            useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin wolproxy
+        fi
+    fi
+
+    chmod 0755 /etc/wolproxy || true
+    if [ -f /etc/wolproxy/config.yaml ]; then
+        chmod 0644 /etc/wolproxy/config.yaml || true
+    fi
+
+    if [ -d /run/systemd/system ]; then
+        systemctl --system daemon-reload >/dev/null 2>&1 || true
+        systemctl enable wolproxy.service >/dev/null 2>&1 || true
+        if /usr/bin/wolproxy check >/dev/null 2>&1; then
+            systemctl restart wolproxy.service >/dev/null 2>&1 || true
+        else
+            echo "wolproxy: 초기 설정이 현재 네트워크 인터페이스와 맞지 않아 자동 시작을 건너뛰었습니다."
+            echo "wolproxy: 'sudo wolproxy'를 실행해 인터페이스와 타깃을 설정한 뒤 's'로 저장·적용하세요."
+        fi
+    fi
+fi
+
+exit 0
