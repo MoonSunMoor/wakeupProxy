@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1027,5 +1028,817 @@ func TestReloadSucceedsAndKeepsListenerWhenIngressInterfaceMissing(t *testing.T)
 	got := make([]byte, 7)
 	if _, err := io.ReadFull(c, got); err != nil || string(got) != "wg-back" {
 		t.Fatalf("expected echo from newly reloaded target pc2, got %q err=%v", got, err)
+	}
+}
+
+type trackingListener struct {
+	net.Listener
+	logicalAddr string
+	closed      atomic.Bool
+	onClose     func()
+}
+
+func (l *trackingListener) Close() error {
+	if l.closed.CompareAndSwap(false, true) && l.onClose != nil {
+		l.onClose()
+	}
+	return l.Listener.Close()
+}
+
+type orderedNFT struct {
+	mu      sync.Mutex
+	ops     []string
+	failErr error
+}
+
+func (n *orderedNFT) Apply(_ context.Context, _ string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.failErr != nil {
+		return n.failErr
+	}
+	n.ops = append(n.ops, "apply")
+	return nil
+}
+
+func (n *orderedNFT) Cleanup(_ context.Context) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.ops = append(n.ops, "cleanup")
+	return nil
+}
+
+func TestConcurrentReloadAndShutdownNoPanicOrNFTLeak(t *testing.T) {
+	_, backendPort := startEchoBackend(t)
+
+	for iter := 0; iter < 25; iter++ {
+		dynIfaces := &dynamicProvider{
+			items: testProxyInterfaces().Items,
+		}
+		nftTracker := &orderedNFT{}
+		var openListeners atomic.Int32
+
+		listenFn := func(_ context.Context, addr string) (net.Listener, error) {
+			rawLn, err := net.Listen("tcp4", "127.0.0.1:0")
+			if err != nil {
+				return nil, err
+			}
+			openListeners.Add(1)
+			return &trackingListener{
+				Listener:    rawLn,
+				logicalAddr: addr,
+				onClose:     func() { openListeners.Add(-1) },
+			}, nil
+		}
+
+		cfg := &config.Config{
+			LANInterface:      "eth0",
+			IngressInterfaces: []string{"wg0"},
+			ProxyPort:         13389,
+			WakeTimeout:       config.Duration(2 * time.Second),
+			WakeCooldown:      config.Duration(500 * time.Millisecond),
+			PollInterval:      config.Duration(50 * time.Millisecond),
+			Clients:           map[string]config.Client{"laptop": {CIDR: "127.0.0.1/32"}},
+			Profiles:          map[string]config.Profile{"ssh": {Port: 22, Wake: config.WakeAuto}},
+			Targets: []config.Target{{
+				Name:     "pc1",
+				IP:       "192.168.0.21",
+				MAC:      "aa:bb:cc:dd:ee:01",
+				Profiles: []string{"ssh"},
+				Allow:    []string{"laptop"},
+			}},
+		}
+
+		srv := NewServer(Options{
+			Interfaces: dynIfaces,
+			NFT:        nftTracker,
+			WoLSender:  &fakeWoLSender{},
+			Listen:     listenFn,
+			Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+			OrigDst: func(_ net.Conn) (netip.AddrPort, error) {
+				return netip.MustParseAddrPort("192.168.0.21:22"), nil
+			},
+			Dial: func(ctx context.Context, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", intToStr(backendPort)))
+			},
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		if err := srv.Start(ctx, cfg); err != nil {
+			cancel()
+			t.Fatalf("iter %d: Start failed: %v", iter, err)
+		}
+
+		// Update wg0's IPv4 so Reload binds a brand-new listener and spawns acceptLoop (s.wg.Add(1))
+		dynIfaces.mu.Lock()
+		dynIfaces.items = []netutil.InterfaceInfo{
+			dynIfaces.items[0],
+			{
+				Name:     "wg0",
+				Index:    3,
+				Prefixes: []netip.Prefix{netip.MustParsePrefix("10.66.0.99/32")},
+				Up:       true,
+			},
+		}
+		dynIfaces.mu.Unlock()
+
+		startGate := make(chan struct{})
+		var wg sync.WaitGroup
+		for r := 0; r < 4; r++ {
+			r := r
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-startGate
+				nextCfg := cfg.Clone()
+				nextCfg.WakeTimeout = config.Duration(time.Duration(30+r) * time.Second)
+				_ = srv.Reload(context.Background(), nextCfg)
+			}()
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-startGate
+			if err := srv.Shutdown(context.Background()); err != nil {
+				t.Errorf("iter %d: Shutdown error: %v", iter, err)
+			}
+		}()
+
+		close(startGate)
+		wg.Wait()
+		cancel()
+
+		if gotOpen := openListeners.Load(); gotOpen != 0 {
+			t.Fatalf("iter %d: leaked %d open listener(s) after concurrent Reload/Shutdown", iter, gotOpen)
+		}
+		nftTracker.mu.Lock()
+		ops := append([]string(nil), nftTracker.ops...)
+		nftTracker.mu.Unlock()
+		if len(ops) == 0 || ops[len(ops)-1] != "cleanup" {
+			t.Fatalf("iter %d: expected final NFT operation to be cleanup, got %v", iter, ops)
+		}
+
+		// Post-shutdown Reload must fail without touching NFT or listeners
+		if err := srv.Reload(context.Background(), cfg.Clone()); err == nil {
+			t.Fatalf("iter %d: expected Reload after Shutdown to fail", iter)
+		}
+		nftTracker.mu.Lock()
+		opsAfter := append([]string(nil), nftTracker.ops...)
+		nftTracker.mu.Unlock()
+		if len(opsAfter) != len(ops) {
+			t.Fatalf("iter %d: post-shutdown Reload touched NFT: %v -> %v", iter, ops, opsAfter)
+		}
+	}
+}
+
+func TestReloadRollbackOnNFTApplyAndBindFailurePreservesListenersAndState(t *testing.T) {
+	_, backendPort := startEchoBackend(t)
+
+	dynIfaces := &dynamicProvider{
+		items: testProxyInterfaces().Items,
+	}
+	nftTracker := &orderedNFT{}
+
+	var mu sync.Mutex
+	byLogical := make(map[string]*trackingListener)
+	var failBindAddr string
+
+	listenFn := func(_ context.Context, addr string) (net.Listener, error) {
+		mu.Lock()
+		shouldFail := failBindAddr != "" && addr == failBindAddr
+		mu.Unlock()
+		if shouldFail {
+			return nil, errors.New("simulated bind failure")
+		}
+		rawLn, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			return nil, err
+		}
+		tl := &trackingListener{Listener: rawLn, logicalAddr: addr}
+		mu.Lock()
+		byLogical[addr] = tl
+		mu.Unlock()
+		return tl, nil
+	}
+
+	cfg := &config.Config{
+		LANInterface:      "eth0",
+		IngressInterfaces: []string{"wg0"},
+		ProxyPort:         13389,
+		WakeTimeout:       config.Duration(2 * time.Second),
+		WakeCooldown:      config.Duration(500 * time.Millisecond),
+		PollInterval:      config.Duration(50 * time.Millisecond),
+		Clients:           map[string]config.Client{"laptop": {CIDR: "127.0.0.1/32"}},
+		Profiles:          map[string]config.Profile{"ssh": {Port: 22, Wake: config.WakeAuto}},
+		Targets: []config.Target{{
+			Name:     "pc1",
+			IP:       "192.168.0.21",
+			MAC:      "aa:bb:cc:dd:ee:01",
+			Profiles: []string{"ssh"},
+			Allow:    []string{"laptop"},
+		}},
+	}
+
+	srv := NewServer(Options{
+		Interfaces: dynIfaces,
+		NFT:        nftTracker,
+		WoLSender:  &fakeWoLSender{},
+		Listen:     listenFn,
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OrigDst: func(_ net.Conn) (netip.AddrPort, error) {
+			return netip.MustParseAddrPort("192.168.0.21:22"), nil
+		},
+		Dial: func(ctx context.Context, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", intToStr(backendPort)))
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	origListenAddr := srv.ListenerAddrs()[0]
+	connExisting, err := net.Dial("tcp4", origListenAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connExisting.Close()
+
+	// Case 1: wg0 IP changes (127.0.0.1 -> 10.66.0.2) AND pc1 is replaced by pc2, but NFT.Apply fails!
+	dynIfaces.mu.Lock()
+	dynIfaces.items = []netutil.InterfaceInfo{
+		dynIfaces.items[0],
+		{
+			Name:     "wg0",
+			Index:    3,
+			Prefixes: []netip.Prefix{netip.MustParsePrefix("10.66.0.2/32")},
+			Up:       true,
+		},
+	}
+	dynIfaces.mu.Unlock()
+
+	nftTracker.mu.Lock()
+	nftTracker.failErr = errors.New("nft apply transaction failed")
+	nftTracker.mu.Unlock()
+
+	replacedCfg := cfg.Clone()
+	replacedCfg.Targets = []config.Target{{
+		Name:     "pc2",
+		IP:       "192.168.0.22",
+		MAC:      "aa:bb:cc:dd:ee:02",
+		Profiles: []string{"ssh"},
+		Allow:    []string{"laptop"},
+	}}
+	if err := srv.Reload(context.Background(), replacedCfg); err == nil {
+		t.Fatal("expected Reload to return error when NFT.Apply fails")
+	}
+
+	mu.Lock()
+	origTL := byLogical["127.0.0.1:13389"]
+	newTL := byLogical["10.66.0.2:13389"]
+	mu.Unlock()
+
+	if origTL == nil || origTL.closed.Load() {
+		t.Fatal("expected original listener 127.0.0.1:13389 to stay open when NFT.Apply fails")
+	}
+	if newTL == nil || !newTL.closed.Load() {
+		t.Fatal("expected newly prepared listener 10.66.0.2:13389 to be closed (rolled back) when NFT.Apply fails")
+	}
+
+	// Active connection to pc1 must remain alive, and new connections to pc1 on original listener must still work!
+	if _, err := connExisting.Write([]byte("still-ok")); err != nil {
+		t.Fatalf("expected existing connection to survive failed Reload: %v", err)
+	}
+	reply := make([]byte, 8)
+	if _, err := io.ReadFull(connExisting, reply); err != nil || string(reply) != "still-ok" {
+		t.Fatalf("expected 'still-ok' echo on existing conn, got %q err=%v", reply, err)
+	}
+
+	connAfterRollback, err := net.Dial("tcp4", origListenAddr)
+	if err != nil {
+		t.Fatalf("expected original listener to still accept connections after rollback: %v", err)
+	}
+	defer connAfterRollback.Close()
+	_, _ = connAfterRollback.Write([]byte("pc1-kept"))
+	if _, err := io.ReadFull(connAfterRollback, reply); err != nil || string(reply) != "pc1-kept" {
+		t.Fatalf("expected curState route to pc1 preserved after rollback, got %q err=%v", reply, err)
+	}
+
+	// Case 2: Partial listener bind failure across 2 new addresses rolls back newly bound listener cleanly
+	dynIfaces.mu.Lock()
+	dynIfaces.items = []netutil.InterfaceInfo{
+		dynIfaces.items[0],
+		{
+			Name:  "wg0",
+			Index: 3,
+			Prefixes: []netip.Prefix{
+				netip.MustParsePrefix("10.66.0.3/32"),
+				netip.MustParsePrefix("10.66.0.4/32"),
+			},
+			Up: true,
+		},
+	}
+	dynIfaces.mu.Unlock()
+	mu.Lock()
+	failBindAddr = "10.66.0.4:13389"
+	mu.Unlock()
+	nftTracker.mu.Lock()
+	nftTracker.failErr = nil
+	nftTracker.mu.Unlock()
+
+	if err := srv.Reload(context.Background(), replacedCfg); err == nil {
+		t.Fatal("expected Reload to fail when second new listener fails to bind")
+	}
+	mu.Lock()
+	firstNew := byLogical["10.66.0.3:13389"]
+	mu.Unlock()
+	if firstNew == nil || !firstNew.closed.Load() {
+		t.Fatal("expected partially bound new listener 10.66.0.3:13389 to be closed on bind failure")
+	}
+	if origTL.closed.Load() {
+		t.Fatal("expected original listener to remain open on partial bind failure")
+	}
+}
+
+func TestReloadRejectsRestartRequiredFieldChangesWithoutPartialApply(t *testing.T) {
+	probeLn, _ := net.Listen("tcp4", "127.0.0.1:0")
+	proxyPort := probeLn.Addr().(*net.TCPAddr).Port
+	_ = probeLn.Close()
+
+	nftMock := &fakeNFT{}
+	cfg := &config.Config{
+		LANInterface:      "eth0",
+		IngressInterfaces: []string{"wg0"},
+		ProxyPort:         proxyPort,
+		WakeTimeout:       config.Duration(2 * time.Second),
+		WakeCooldown:      config.Duration(500 * time.Millisecond),
+		PollInterval:      config.Duration(50 * time.Millisecond),
+		Clients:           map[string]config.Client{"laptop": {CIDR: "127.0.0.1/32"}},
+		Profiles:          map[string]config.Profile{"ssh": {Port: 22, Wake: config.WakeAuto}},
+		Targets: []config.Target{{
+			Name:     "pc1",
+			IP:       "192.168.0.21",
+			MAC:      "aa:bb:cc:dd:ee:01",
+			Profiles: []string{"ssh"},
+			Allow:    []string{"laptop"},
+		}},
+	}
+
+	srv := NewServer(Options{
+		Interfaces: testProxyInterfaces(),
+		NFT:        nftMock,
+		WoLSender:  &fakeWoLSender{},
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	cases := []struct {
+		name      string
+		mutate    func(c *config.Config)
+		wantField string
+	}{
+		{
+			name:      "lan_interface change",
+			mutate:    func(c *config.Config) { c.LANInterface = "eth1" },
+			wantField: "lan_interface",
+		},
+		{
+			name:      "ingress_interfaces change",
+			mutate:    func(c *config.Config) { c.IngressInterfaces = []string{"wg0", "wg1"} },
+			wantField: "ingress_interfaces",
+		},
+		{
+			name:      "proxy_port change",
+			mutate:    func(c *config.Config) { c.ProxyPort = proxyPort + 10 },
+			wantField: "proxy_port",
+		},
+	}
+
+	for _, tc := range cases {
+		next := cfg.Clone()
+		tc.mutate(next)
+		// Also add pc2 to ensure Reload does NOT partially apply targets/rulesets (no Split-Brain).
+		next.Targets = append(next.Targets, config.Target{
+			Name:     "pc2",
+			IP:       "192.168.0.22",
+			MAC:      "aa:bb:cc:dd:ee:02",
+			Profiles: []string{"ssh"},
+			Allow:    []string{"laptop"},
+		})
+
+		err := srv.Reload(context.Background(), next)
+		if err == nil {
+			t.Fatalf("%s: expected Reload to reject change with explicit error", tc.name)
+		}
+		if !strings.Contains(err.Error(), tc.wantField) || !strings.Contains(err.Error(), "systemctl restart wolproxy") {
+			t.Fatalf("%s: expected error mentioning %q and 'systemctl restart wolproxy', got: %v", tc.name, tc.wantField, err)
+		}
+
+		nftMock.mu.Lock()
+		applyCount := len(nftMock.rulesets)
+		nftMock.mu.Unlock()
+		if applyCount != 1 {
+			t.Fatalf("%s: expected NFT.Apply count to stay 1 (initial Start only), got %d", tc.name, applyCount)
+		}
+
+		srv.connsMu.Lock()
+		_, hasPC2 := srv.curState.routes[netip.MustParseAddrPort("192.168.0.22:22")]
+		srv.connsMu.Unlock()
+		if hasPC2 {
+			t.Fatalf("%s: Reload partially applied pc2 despite rejecting restart-required change", tc.name)
+		}
+	}
+}
+
+func TestReloadAbortsWakingOnWakeNeverWhileKeepingRelayingAcrossMetadataChanges(t *testing.T) {
+	_, backendPort := startEchoBackend(t)
+
+	probeLn, _ := net.Listen("tcp4", "127.0.0.1:0")
+	proxyPort := probeLn.Addr().(*net.TCPAddr).Port
+	_ = probeLn.Close()
+
+	cfg := &config.Config{
+		LANInterface:      "eth0",
+		IngressInterfaces: []string{"wg0"},
+		ProxyPort:         proxyPort,
+		WakeTimeout:       config.Duration(10 * time.Second),
+		WakeCooldown:      config.Duration(time.Second),
+		PollInterval:      config.Duration(80 * time.Millisecond),
+		Clients:           map[string]config.Client{"laptop": {CIDR: "127.0.0.1/32"}},
+		Profiles:          map[string]config.Profile{"ssh": {Port: 22, Wake: config.WakeAuto}},
+		Targets: []config.Target{
+			{
+				Name:     "pc-awake",
+				IP:       "192.168.0.21",
+				MAC:      "aa:bb:cc:dd:ee:01",
+				Profiles: []string{"ssh"},
+				Allow:    []string{"laptop"},
+			},
+			{
+				Name:     "pc-sleep",
+				IP:       "192.168.0.22",
+				MAC:      "aa:bb:cc:dd:ee:02",
+				Profiles: []string{"ssh"},
+				Allow:    []string{"laptop"},
+			},
+		},
+	}
+
+	var nextOrigDst atomic.Value
+	srv := NewServer(Options{
+		Interfaces: testProxyInterfaces(),
+		NFT:        &fakeNFT{},
+		WoLSender:  &fakeWoLSender{},
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OrigDst: func(_ net.Conn) (netip.AddrPort, error) {
+			return nextOrigDst.Load().(netip.AddrPort), nil
+		},
+		Dial: func(ctx context.Context, addr string) (net.Conn, error) {
+			if addr == "192.168.0.22:22" {
+				return nil, syscall.EHOSTUNREACH
+			}
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", intToStr(backendPort)))
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	listenAddr := srv.ListenerAddrs()[0]
+
+	// 1. Establish a relaying connection to pc-awake
+	nextOrigDst.Store(netip.MustParseAddrPort("192.168.0.21:22"))
+	connRelay, err := net.Dial("tcp4", listenAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connRelay.Close()
+	if _, err := connRelay.Write([]byte("ping0")); err != nil {
+		t.Fatal(err)
+	}
+	buf5 := make([]byte, 5)
+	if _, err := io.ReadFull(connRelay, buf5); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Establish a waking connection to pc-sleep and wait until it enters waking phase
+	nextOrigDst.Store(netip.MustParseAddrPort("192.168.0.22:22"))
+	connWake, err := net.Dial("tcp4", listenAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connWake.Close()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		srv.connsMu.Lock()
+		w := srv.waitingByTarget["pc-sleep"]
+		srv.connsMu.Unlock()
+		if w == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 3. Reload:
+	//    - Rename profile "ssh" -> "ssh-manual" on port 22 with wake: auto -> never
+	//    - Rename target "pc-awake" -> "pc-awake-renamed" and fix MAC typo
+	//    - Keep pc-sleep on "ssh-manual" (wake: never)
+	reloaded := cfg.Clone()
+	reloaded.Profiles = map[string]config.Profile{
+		"ssh-manual": {Port: 22, Wake: config.WakeNever},
+	}
+	reloaded.Targets = []config.Target{
+		{
+			Name:     "pc-awake-renamed",
+			IP:       "192.168.0.21",
+			MAC:      "aa:bb:cc:dd:ee:99",
+			Profiles: []string{"ssh-manual"},
+			Allow:    []string{"laptop"},
+		},
+		{
+			Name:     "pc-sleep",
+			IP:       "192.168.0.22",
+			MAC:      "aa:bb:cc:dd:ee:02",
+			Profiles: []string{"ssh-manual"},
+			Allow:    []string{"laptop"},
+		},
+	}
+	if err := srv.Reload(context.Background(), reloaded); err != nil {
+		t.Fatalf("Reload failed: %v", err)
+	}
+
+	// Waking connection must be aborted immediately due to wake: auto -> never!
+	_ = connWake.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if _, err := connWake.Read(make([]byte, 4)); err == nil {
+		t.Fatal("expected waking connection to be aborted immediately when wake changed auto -> never")
+	}
+
+	// Relaying connection must stay alive despite target rename, profile rename, MAC change, and wake: never!
+	_ = connRelay.SetDeadline(time.Now().Add(time.Second))
+	if _, err := connRelay.Write([]byte("alive")); err != nil {
+		t.Fatalf("expected relaying connection to survive metadata/wake/MAC reload: %v", err)
+	}
+	if _, err := io.ReadFull(connRelay, buf5); err != nil || string(buf5) != "alive" {
+		t.Fatalf("expected relaying connection echo 'alive', got %q err=%v", buf5, err)
+	}
+}
+
+func TestReloadReturnsValidationErrorsBeforeRestartRequiredError(t *testing.T) {
+	probeLn, _ := net.Listen("tcp4", "127.0.0.1:0")
+	proxyPort := probeLn.Addr().(*net.TCPAddr).Port
+	_ = probeLn.Close()
+
+	cfg := &config.Config{
+		LANInterface:      "eth0",
+		IngressInterfaces: []string{"wg0"},
+		ProxyPort:         proxyPort,
+		WakeTimeout:       config.Duration(2 * time.Second),
+		WakeCooldown:      config.Duration(500 * time.Millisecond),
+		PollInterval:      config.Duration(50 * time.Millisecond),
+		Clients:           map[string]config.Client{"laptop": {CIDR: "127.0.0.1/32"}},
+		Profiles:          map[string]config.Profile{"ssh": {Port: 22, Wake: config.WakeAuto}},
+		Targets: []config.Target{{
+			Name:     "pc1",
+			IP:       "192.168.0.21",
+			MAC:      "aa:bb:cc:dd:ee:01",
+			Profiles: []string{"ssh"},
+			Allow:    []string{"laptop"},
+		}},
+	}
+
+	srv := NewServer(Options{
+		Interfaces: testProxyInterfaces(),
+		NFT:        &fakeNFT{},
+		WoLSender:  &fakeWoLSender{},
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	// 1. Both proxy_port change AND invalid target MAC -> validation error must take precedence!
+	badPortAndMAC := cfg.Clone()
+	badPortAndMAC.ProxyPort = proxyPort + 10
+	badPortAndMAC.Targets[0].MAC = "not-a-valid-mac"
+	err := srv.Reload(context.Background(), badPortAndMAC)
+	if err == nil {
+		t.Fatal("expected Reload error for invalid MAC + changed proxy_port")
+	}
+	var valErrs config.ValidationErrorList
+	if !errors.As(err, &valErrs) {
+		t.Fatalf("expected ValidationErrorList before restart-required error, got %T: %v", err, err)
+	}
+	if strings.Contains(err.Error(), "systemctl restart wolproxy") {
+		t.Fatalf("expected validation error rather than restart prompt for broken config, got: %v", err)
+	}
+
+	// 2. Both lan_interface change (missing interface -> warning under StrictInterfaces=false) AND duplicate target IP -> validation error takes precedence!
+	badLANAndDupIP := cfg.Clone()
+	badLANAndDupIP.LANInterface = "eth99"
+	badLANAndDupIP.Targets = append(badLANAndDupIP.Targets, config.Target{
+		Name:     "pc2",
+		IP:       "192.168.0.21", // duplicate of pc1!
+		MAC:      "aa:bb:cc:dd:ee:02",
+		Profiles: []string{"ssh"},
+		Allow:    []string{"laptop"},
+	})
+	err = srv.Reload(context.Background(), badLANAndDupIP)
+	if !errors.As(err, &valErrs) {
+		t.Fatalf("expected ValidationErrorList for duplicate IP even when lan_interface changed, got %T: %v", err, err)
+	}
+
+	// 3. Surrounding whitespace on unchanged LANInterface / IngressInterfaces does not falsely reject Reload
+	trimmedSame := cfg.Clone()
+	trimmedSame.LANInterface = " eth0 "
+	trimmedSame.IngressInterfaces = []string{" wg0 "}
+	if err := srv.Reload(context.Background(), trimmedSame); err != nil {
+		t.Fatalf("expected Reload with surrounding whitespace on same interfaces to succeed, got: %v", err)
+	}
+}
+
+type hookNFT struct {
+	mu       sync.Mutex
+	rulesets []string
+	onApply  func(call int, ruleset string)
+}
+
+func (h *hookNFT) Apply(_ context.Context, ruleset string) error {
+	h.mu.Lock()
+	h.rulesets = append(h.rulesets, ruleset)
+	call := len(h.rulesets)
+	fn := h.onApply
+	h.mu.Unlock()
+	if fn != nil {
+		fn(call, ruleset)
+	}
+	return nil
+}
+
+func (h *hookNFT) Cleanup(_ context.Context) error { return nil }
+
+func TestConcurrentReloadFromFileAppliesLatestDiskSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+
+	probeLn, _ := net.Listen("tcp4", "127.0.0.1:0")
+	proxyPort := probeLn.Addr().(*net.TCPAddr).Port
+	_ = probeLn.Close()
+
+	baseCfg := &config.Config{
+		LANInterface:      "eth0",
+		IngressInterfaces: []string{"wg0"},
+		ProxyPort:         proxyPort,
+		WakeTimeout:       config.Duration(20 * time.Second),
+		WakeCooldown:      config.Duration(time.Second),
+		PollInterval:      config.Duration(100 * time.Millisecond),
+		Clients:           map[string]config.Client{"laptop": {CIDR: "127.0.0.1/32"}},
+		Profiles:          map[string]config.Profile{"ssh": {Port: 22, Wake: config.WakeAuto}},
+		Targets: []config.Target{{
+			Name:     "pc1",
+			IP:       "192.168.0.21",
+			MAC:      "aa:bb:cc:dd:ee:01",
+			Profiles: []string{"ssh"},
+			Allow:    []string{"laptop"},
+		}},
+	}
+	if _, err := config.SaveAtomicChecked(cfgPath, baseCfg, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	inFirstReloadApply := make(chan struct{})
+	releaseFirstReloadApply := make(chan struct{})
+	nftHook := &hookNFT{
+		onApply: func(call int, _ string) {
+			// call == 1 is initial Start(); call == 2 is first ReloadFromFile()
+			if call == 2 {
+				close(inFirstReloadApply)
+				<-releaseFirstReloadApply
+			}
+		},
+	}
+
+	srv := NewServer(Options{
+		ConfigPath: cfgPath,
+		Interfaces: testProxyInterfaces(),
+		NFT:        nftHook,
+		WoLSender:  &fakeWoLSender{},
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx, baseCfg); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	// Write v1 to disk and start first ReloadFromFile (which pauses inside NFT.Apply while holding lifecycleMu).
+	v1 := baseCfg.Clone()
+	v1.WakeTimeout = config.Duration(45 * time.Second)
+	v1.Targets = append(v1.Targets, config.Target{
+		Name:     "pc2",
+		IP:       "192.168.0.22",
+		MAC:      "aa:bb:cc:dd:ee:02",
+		Profiles: []string{"ssh"},
+		Allow:    []string{"laptop"},
+	})
+	if _, err := config.SaveAtomicChecked(cfgPath, v1, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 2)
+	go func() {
+		errCh <- srv.ReloadFromFile(context.Background())
+	}()
+
+	<-inFirstReloadApply
+
+	// Start second ReloadFromFile BEFORE updating disk to v2? No: update disk to v2 while first holds lifecycleMu,
+	// AND verify second ReloadFromFile reads v2 AFTER acquiring lifecycleMu (never reading stale v1 early if queued),
+	// plus verify order of rulesets!
+	// Even stronger: launch goroutine 2 BEFORE updating disk? Wait: if goroutine 2 blocks on lifecycleMu BEFORE config.Load,
+	// then updating disk to v2 WHILE goroutine 2 is waiting on lifecycleMu means goroutine 2 WILL read v2 once unblocked —
+	// whereas WITHOUT lifecycleMu around config.Load, goroutine 2 would have ALREADY read stale v1 before blocking on reloadMu!
+	r2Started := make(chan struct{})
+	go func() {
+		close(r2Started)
+		errCh <- srv.ReloadFromFile(context.Background())
+	}()
+	<-r2Started
+	// Give goroutine 2 a moment to reach lifecycleMu.Lock() (if config.Load were outside lifecycleMu, it would read v1 right here!)
+	time.Sleep(25 * time.Millisecond)
+
+	v2 := v1.Clone()
+	v2.WakeTimeout = config.Duration(95 * time.Second)
+	v2.Targets = append(v2.Targets, config.Target{
+		Name:     "pc3",
+		IP:       "192.168.0.23",
+		MAC:      "aa:bb:cc:dd:ee:03",
+		Profiles: []string{"ssh"},
+		Allow:    []string{"laptop"},
+	})
+	if _, err := config.SaveAtomicChecked(cfgPath, v2, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	close(releaseFirstReloadApply)
+
+	for i := 0; i < 2; i++ {
+		if rErr := <-errCh; rErr != nil {
+			t.Fatalf("ReloadFromFile %d failed: %v", i+1, rErr)
+		}
+	}
+
+	// Because config.Load runs inside lifecycleMu, the queued ReloadFromFile MUST have read v2!
+	srv.connsMu.Lock()
+	gotWakeTimeout := srv.curState.wakeTimeout
+	_, hasPC3 := srv.curState.routes[netip.MustParseAddrPort("192.168.0.23:22")]
+	srv.connsMu.Unlock()
+
+	if !hasPC3 || gotWakeTimeout != 95*time.Second {
+		t.Fatalf("expected queued ReloadFromFile to load latest v2 after acquiring lifecycleMu, got hasPC3=%v wakeTimeout=%v", hasPC3, gotWakeTimeout)
+	}
+
+	nftHook.mu.Lock()
+	finalRuleset := nftHook.rulesets[len(nftHook.rulesets)-1]
+	applyCountBeforeShutdown := len(nftHook.rulesets)
+	nftHook.mu.Unlock()
+	if !strings.Contains(finalRuleset, "192.168.0.23 . 22") {
+		t.Fatalf("expected final nft ruleset to include pc3 from v2:\n%s", finalRuleset)
+	}
+
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.ReloadFromFile(context.Background()); err == nil {
+		t.Fatal("expected ReloadFromFile after Shutdown to fail")
+	}
+	nftHook.mu.Lock()
+	applyCountAfter := len(nftHook.rulesets)
+	nftHook.mu.Unlock()
+	if applyCountAfter != applyCountBeforeShutdown {
+		t.Fatalf("post-shutdown ReloadFromFile touched NFT: %d -> %d", applyCountBeforeShutdown, applyCountAfter)
 	}
 }

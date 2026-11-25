@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -53,6 +54,7 @@ func printUsage(w io.Writer) {
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer, isStdinTTY func() bool) int {
 	cfgPath := config.DefaultConfigPath
+	var cfgPathExplicit bool
 	var rest []string
 
 	for i := 0; i < len(args); i++ {
@@ -71,9 +73,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, isStdinTTY fu
 				return 2
 			}
 			cfgPath = args[i+1]
+			cfgPathExplicit = true
 			i++
 		case strings.HasPrefix(arg, "-c="):
 			cfgPath = strings.TrimPrefix(arg, "-c=")
+			cfgPathExplicit = true
 		default:
 			rest = append(rest, arg)
 		}
@@ -103,7 +107,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, isStdinTTY fu
 			fmt.Fprintf(stderr, "오류: 알 수 없는 인자입니다: %s\n", strings.Join(subArgs, " "))
 			return 2
 		}
-		return runReload(stderr)
+		return runReload(cfgPath, cfgPathExplicit, stderr)
 
 	case "wake":
 		return runWake(cfgPath, subArgs, stderr)
@@ -285,10 +289,33 @@ func runWake(cfgPath string, args []string, stderr io.Writer) int {
 	return 0
 }
 
-func runReload(stderr io.Writer) int {
+func isSystemdManaged() bool {
+	return strings.TrimSpace(os.Getenv("NOTIFY_SOCKET")) != "" ||
+		strings.TrimSpace(os.Getenv("INVOCATION_ID")) != ""
+}
+
+func runReload(cfgPath string, cfgPathExplicit bool, stderr io.Writer) int {
+	rtDir := daemon.RuntimeDir()
+	st, ok, err := daemon.ReadRuntimeState(rtDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "재적재 실패: 런타임 상태 읽기 오류: %v\n", err)
+		return 1
+	}
+	if cfgPathExplicit {
+		if ok && strings.TrimSpace(st.ConfigPath) != "" {
+			if !daemon.SameConfigPath(cfgPath, st.ConfigPath) {
+				fmt.Fprintf(stderr, "재적재 실패: 지정한 설정 경로(%s)가 실행 중인 데몬의 설정 경로(%s)와 다릅니다.\n", cfgPath, st.ConfigPath)
+				return 1
+			}
+		} else if !ok && daemon.HasControlSocket(rtDir) && !daemon.SameConfigPath(cfgPath, config.DefaultConfigPath) {
+			fmt.Fprintf(stderr, "재적재 실패: 지정한 설정 경로(%s)가 기본 서비스 설정 경로(%s)와 다릅니다.\n", cfgPath, config.DefaultConfigPath)
+			return 1
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := daemon.RequestReload(ctx, daemon.RuntimeDir()); err != nil {
+	if err := daemon.RequestReload(ctx, rtDir); err != nil {
 		fmt.Fprintf(stderr, "재적재 실패: %v\n", err)
 		return 1
 	}
@@ -296,7 +323,27 @@ func runReload(stderr io.Writer) int {
 }
 
 func runServe(cfgPath string, stderr io.Writer) int {
-	logger := newDaemonLogger(stderr)
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGTERM, os.Interrupt)
+	defer signal.Stop(sigCh)
+
+	return serveWithOptions(cfgPath, stderr, proxy.Options{
+		ConfigPath: cfgPath,
+		Interfaces: netutil.SystemProvider{},
+		NFT:        nft.CLIManager{},
+		WoLSender:  wol.UDPSender{},
+	}, sigCh)
+}
+
+func serveWithOptions(cfgPath string, stderr io.Writer, opts proxy.Options, sigCh <-chan os.Signal) int {
+	logger := opts.Logger
+	if logger == nil {
+		logger = newDaemonLogger(stderr)
+		opts.Logger = logger
+	}
+	if opts.ConfigPath == "" {
+		opts.ConfigPath = cfgPath
+	}
 
 	cfg, _, err := config.Load(cfgPath)
 	if err != nil {
@@ -304,13 +351,7 @@ func runServe(cfgPath string, stderr io.Writer) int {
 		return 1
 	}
 
-	srv := proxy.NewServer(proxy.Options{
-		ConfigPath: cfgPath,
-		Interfaces: netutil.SystemProvider{},
-		NFT:        nft.CLIManager{},
-		WoLSender:  wol.UDPSender{},
-		Logger:     logger,
-	})
+	srv := proxy.NewServer(opts)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -327,22 +368,39 @@ func runServe(cfgPath string, stderr io.Writer) int {
 		return 1
 	}
 
+	managed := isSystemdManaged()
 	startedAt := time.Now().UTC()
 	rtDir := daemon.RuntimeDir()
-	publishState := func() {
-		if snap, ok := srv.Snapshot(); ok {
-			if err := daemon.WriteRuntimeState(rtDir, daemon.NewRuntimeState(cfgPath, snap, startedAt)); err != nil {
-				logger.Debug("런타임 상태 파일 기록 생략", "dir", rtDir, "error", err)
-			}
+	publishState := func() error {
+		snap, ok := srv.Snapshot()
+		if !ok {
+			return errors.New("서버 런타임 스냅샷을 가져올 수 없습니다")
 		}
+		return daemon.WriteRuntimeState(rtDir, daemon.NewRuntimeState(cfgPath, snap, startedAt))
 	}
-	publishState()
 
+	if stateErr := publishState(); stateErr != nil {
+		if managed {
+			logger.Error("런타임 상태 파일 기록 실패 (systemd 관리 모드)", "dir", rtDir, "error", stateErr)
+			shutCtx, sCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = srv.Shutdown(shutCtx)
+			sCancel()
+			return 1
+		}
+		logger.Warn("런타임 상태 파일 기록 불가 (비관리 실행 모드)", "dir", rtDir, "error", stateErr)
+	}
+
+	var reloadOpMu sync.Mutex
 	doReload := func(rCtx context.Context) error {
+		reloadOpMu.Lock()
+		defer reloadOpMu.Unlock()
+
 		_ = daemon.NotifyReloading()
 		err := srv.ReloadFromFile(rCtx)
 		if err == nil {
-			publishState()
+			if stateErr := publishState(); stateErr != nil {
+				logger.Warn("재적재 후 런타임 상태 파일 갱신 실패", "dir", rtDir, "error", stateErr)
+			}
 		}
 		_ = daemon.NotifyReady()
 		return err
@@ -350,6 +408,14 @@ func runServe(cfgPath string, stderr io.Writer) int {
 
 	ctrlSrv, ctrlErr := daemon.StartControlServer(rtDir, doReload)
 	if ctrlErr != nil {
+		if managed {
+			logger.Error("제어 소켓 생성 실패 (systemd 관리 모드)", "dir", rtDir, "error", ctrlErr)
+			daemon.RemoveRuntimeState(rtDir)
+			shutCtx, sCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = srv.Shutdown(shutCtx)
+			sCancel()
+			return 1
+		}
 		logger.Warn("제어 소켓 생성 불가 (비관리 실행 모드)", "dir", rtDir, "error", ctrlErr)
 	}
 	defer func() {
@@ -363,10 +429,6 @@ func runServe(cfgPath string, stderr io.Writer) int {
 		logger.Warn("systemd READY 알림 실패", "error", err)
 	}
 
-	sigCh := make(chan os.Signal, 2)
-	signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGTERM, os.Interrupt)
-	defer signal.Stop(sigCh)
-
 	for sig := range sigCh {
 		if sig == syscall.SIGHUP {
 			reloadCtx, rCancel := context.WithTimeout(ctx, 10*time.Second)
@@ -377,6 +439,12 @@ func runServe(cfgPath string, stderr io.Writer) int {
 
 		logger.Info("종료 시그널 수신, 정리 중...", "signal", sig.String())
 		_ = daemon.NotifyStopping()
+		// Close control socket before Shutdown so no new control reload requests can enter.
+		if ctrlSrv != nil {
+			_ = ctrlSrv.Close()
+			ctrlSrv = nil
+		}
+		daemon.RemoveRuntimeState(rtDir)
 		cancel()
 		shutCtx, sCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err := srv.Shutdown(shutCtx)

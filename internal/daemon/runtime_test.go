@@ -72,3 +72,32 @@ func TestControlServerSynchronousReloadSuccessAndFailure(t *testing.T) {
 		t.Fatal("expected RequestReload to return error when reloadFn fails")
 	}
 }
+
+func TestSameConfigPathNormalizesRelativeAndSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	realCfg := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(realCfg, []byte("proxy_port: 13389\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	subDir := filepath.Join(dir, "nested")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	relStyle := filepath.Join(subDir, "..", "config.yaml")
+	if !SameConfigPath(realCfg, relStyle) {
+		t.Fatalf("expected SameConfigPath(%q, %q) == true", realCfg, relStyle)
+	}
+
+	otherCfg := filepath.Join(dir, "other.yaml")
+	if SameConfigPath(realCfg, otherCfg) {
+		t.Fatalf("expected SameConfigPath(%q, %q) == false", realCfg, otherCfg)
+	}
+
+	linkCfg := filepath.Join(dir, "linked-config.yaml")
+	if err := os.Symlink(realCfg, linkCfg); err == nil {
+		if !SameConfigPath(realCfg, linkCfg) {
+			t.Fatalf("expected symlink %q to match target %q", linkCfg, realCfg)
+		}
+	}
+}

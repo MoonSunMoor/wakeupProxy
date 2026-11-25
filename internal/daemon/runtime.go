@@ -9,6 +9,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,6 +44,46 @@ type RuntimeState struct {
 	UpdatedAt         time.Time `json:"updated_at"`
 }
 
+// NormalizeConfigPath canonicalizes a config file path for equality comparison,
+// resolving symlinks via filepath.EvalSymlinks and falling back to filepath.Abs + filepath.Clean
+// (including resolving an existing parent directory when the target file does not yet exist).
+func NormalizeConfigPath(p string) string {
+	trimmed := strings.TrimSpace(p)
+	if trimmed == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(trimmed)
+	if err != nil {
+		abs = filepath.Clean(trimmed)
+	} else {
+		abs = filepath.Clean(abs)
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved)
+	}
+	dir := filepath.Dir(abs)
+	base := filepath.Base(abs)
+	if dir != "" && dir != abs {
+		if resolvedDir, err := filepath.EvalSymlinks(dir); err == nil {
+			return filepath.Join(filepath.Clean(resolvedDir), base)
+		}
+	}
+	return abs
+}
+
+// SameConfigPath reports whether two config paths refer to the same canonical file location.
+func SameConfigPath(a, b string) bool {
+	na := NormalizeConfigPath(a)
+	nb := NormalizeConfigPath(b)
+	if na == "" || nb == "" {
+		return na == nb
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(na, nb)
+	}
+	return na == nb
+}
+
 func NewRuntimeState(cfgPath string, snap proxy.RuntimeSnapshot, startedAt time.Time) RuntimeState {
 	now := time.Now().UTC()
 	if startedAt.IsZero() {
@@ -49,7 +91,7 @@ func NewRuntimeState(cfgPath string, snap proxy.RuntimeSnapshot, startedAt time.
 	}
 	return RuntimeState{
 		PID:               os.Getpid(),
-		ConfigPath:        cfgPath,
+		ConfigPath:        NormalizeConfigPath(cfgPath),
 		LANInterface:      snap.LANInterface,
 		IngressInterfaces: append([]string(nil), snap.IngressInterfaces...),
 		ProxyPort:         snap.ProxyPort,
@@ -61,8 +103,8 @@ func NewRuntimeState(cfgPath string, snap proxy.RuntimeSnapshot, startedAt time.
 
 // WriteRuntimeState atomically writes state.json into dir (mode 0644).
 func WriteRuntimeState(dir string, st RuntimeState) error {
-	if dir == "" {
-		return nil
+	if strings.TrimSpace(dir) == "" {
+		return errors.New("런타임 디렉터리가 비어 있습니다")
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -132,6 +174,15 @@ func RemoveRuntimeState(dir string) {
 	_ = os.Remove(filepath.Join(dir, stateFileName))
 }
 
+// HasControlSocket reports whether control.sock currently exists in dir.
+func HasControlSocket(dir string) bool {
+	if strings.TrimSpace(dir) == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(dir, controlSockName))
+	return err == nil
+}
+
 type controlRequest struct {
 	Cmd string `json:"cmd"`
 }
@@ -144,10 +195,12 @@ type controlResponse struct {
 // ControlServer exposes a synchronous Unix domain control socket (`control.sock`)
 // so `wolproxy reload` (`ExecReload`) waits for actual reload validation & nft application.
 type ControlServer struct {
-	sockPath string
-	ln       net.Listener
-	reloadFn func(ctx context.Context) error
-	wg       sync.WaitGroup
+	sockPath  string
+	ln        net.Listener
+	reloadFn  func(ctx context.Context) error
+	wg        sync.WaitGroup
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func StartControlServer(dir string, reloadFn func(ctx context.Context) error) (*ControlServer, error) {
@@ -230,10 +283,12 @@ func (cs *ControlServer) Close() error {
 	if cs == nil {
 		return nil
 	}
-	err := cs.ln.Close()
-	cs.wg.Wait()
-	_ = os.Remove(cs.sockPath)
-	return err
+	cs.closeOnce.Do(func() {
+		cs.closeErr = cs.ln.Close()
+		cs.wg.Wait()
+		_ = os.Remove(cs.sockPath)
+	})
+	return cs.closeErr
 }
 
 // RequestReload connects to the daemon's Unix control socket and waits synchronously

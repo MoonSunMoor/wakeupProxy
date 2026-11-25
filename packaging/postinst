@@ -21,6 +21,7 @@ if [ "$1" = "configure" ]; then
         if /usr/bin/wolproxy check >/dev/null 2>&1 && systemctl restart wolproxy.service >/dev/null 2>&1; then
             :
         else
+            systemctl stop wolproxy.service >/dev/null 2>&1 || true
             systemctl reset-failed wolproxy.service >/dev/null 2>&1 || true
             echo "wolproxy: 초기 설정이 현재 네트워크 인터페이스와 맞지 않아 자동 시작을 건너뛰었습니다."
             echo "wolproxy: 'sudo wolproxy'를 실행해 인터페이스와 타깃을 설정한 뒤 's'로 저장·적용하세요."
