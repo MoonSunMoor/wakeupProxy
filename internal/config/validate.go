@@ -123,18 +123,19 @@ func ValidateWithOptions(cfg *Config, ifaces netutil.Provider, opts ValidateOpti
 			Message: "LAN 인터페이스를 지정해야 합니다",
 		})
 	} else {
-		info, err := ifaces.InterfaceByName(cfg.LANInterface)
+		lanName := strings.TrimSpace(cfg.LANInterface)
+		info, err := ifaces.InterfaceByName(lanName)
 		if err != nil {
 			addIfaceIssue(ValidationError{
 				Section: SectionGlobal,
 				Field:   "lan_interface",
-				Message: fmt.Sprintf("존재하지 않는 LAN 인터페이스입니다: %s", cfg.LANInterface),
+				Message: fmt.Sprintf("존재하지 않는 LAN 인터페이스입니다: %s", lanName),
 			})
 		} else if len(info.Prefixes) == 0 {
 			addIfaceIssue(ValidationError{
 				Section: SectionGlobal,
 				Field:   "lan_interface",
-				Message: fmt.Sprintf("LAN 인터페이스(%s)에 IPv4 주소가 없습니다", cfg.LANInterface),
+				Message: fmt.Sprintf("LAN 인터페이스(%s)에 IPv4 주소가 없습니다", lanName),
 			})
 		} else {
 			lanInfo = info

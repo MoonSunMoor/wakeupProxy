@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1597,5 +1598,247 @@ func TestReloadAbortsWakingOnWakeNeverWhileKeepingRelayingAcrossMetadataChanges(
 	}
 	if _, err := io.ReadFull(connRelay, buf5); err != nil || string(buf5) != "alive" {
 		t.Fatalf("expected relaying connection echo 'alive', got %q err=%v", buf5, err)
+	}
+}
+
+func TestReloadReturnsValidationErrorsBeforeRestartRequiredError(t *testing.T) {
+	probeLn, _ := net.Listen("tcp4", "127.0.0.1:0")
+	proxyPort := probeLn.Addr().(*net.TCPAddr).Port
+	_ = probeLn.Close()
+
+	cfg := &config.Config{
+		LANInterface:      "eth0",
+		IngressInterfaces: []string{"wg0"},
+		ProxyPort:         proxyPort,
+		WakeTimeout:       config.Duration(2 * time.Second),
+		WakeCooldown:      config.Duration(500 * time.Millisecond),
+		PollInterval:      config.Duration(50 * time.Millisecond),
+		Clients:           map[string]config.Client{"laptop": {CIDR: "127.0.0.1/32"}},
+		Profiles:          map[string]config.Profile{"ssh": {Port: 22, Wake: config.WakeAuto}},
+		Targets: []config.Target{{
+			Name:     "pc1",
+			IP:       "192.168.0.21",
+			MAC:      "aa:bb:cc:dd:ee:01",
+			Profiles: []string{"ssh"},
+			Allow:    []string{"laptop"},
+		}},
+	}
+
+	srv := NewServer(Options{
+		Interfaces: testProxyInterfaces(),
+		NFT:        &fakeNFT{},
+		WoLSender:  &fakeWoLSender{},
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	// 1. Both proxy_port change AND invalid target MAC -> validation error must take precedence!
+	badPortAndMAC := cfg.Clone()
+	badPortAndMAC.ProxyPort = proxyPort + 10
+	badPortAndMAC.Targets[0].MAC = "not-a-valid-mac"
+	err := srv.Reload(context.Background(), badPortAndMAC)
+	if err == nil {
+		t.Fatal("expected Reload error for invalid MAC + changed proxy_port")
+	}
+	var valErrs config.ValidationErrorList
+	if !errors.As(err, &valErrs) {
+		t.Fatalf("expected ValidationErrorList before restart-required error, got %T: %v", err, err)
+	}
+	if strings.Contains(err.Error(), "systemctl restart wolproxy") {
+		t.Fatalf("expected validation error rather than restart prompt for broken config, got: %v", err)
+	}
+
+	// 2. Both lan_interface change (missing interface -> warning under StrictInterfaces=false) AND duplicate target IP -> validation error takes precedence!
+	badLANAndDupIP := cfg.Clone()
+	badLANAndDupIP.LANInterface = "eth99"
+	badLANAndDupIP.Targets = append(badLANAndDupIP.Targets, config.Target{
+		Name:     "pc2",
+		IP:       "192.168.0.21", // duplicate of pc1!
+		MAC:      "aa:bb:cc:dd:ee:02",
+		Profiles: []string{"ssh"},
+		Allow:    []string{"laptop"},
+	})
+	err = srv.Reload(context.Background(), badLANAndDupIP)
+	if !errors.As(err, &valErrs) {
+		t.Fatalf("expected ValidationErrorList for duplicate IP even when lan_interface changed, got %T: %v", err, err)
+	}
+
+	// 3. Surrounding whitespace on unchanged LANInterface / IngressInterfaces does not falsely reject Reload
+	trimmedSame := cfg.Clone()
+	trimmedSame.LANInterface = " eth0 "
+	trimmedSame.IngressInterfaces = []string{" wg0 "}
+	if err := srv.Reload(context.Background(), trimmedSame); err != nil {
+		t.Fatalf("expected Reload with surrounding whitespace on same interfaces to succeed, got: %v", err)
+	}
+}
+
+type hookNFT struct {
+	mu       sync.Mutex
+	rulesets []string
+	onApply  func(call int, ruleset string)
+}
+
+func (h *hookNFT) Apply(_ context.Context, ruleset string) error {
+	h.mu.Lock()
+	h.rulesets = append(h.rulesets, ruleset)
+	call := len(h.rulesets)
+	fn := h.onApply
+	h.mu.Unlock()
+	if fn != nil {
+		fn(call, ruleset)
+	}
+	return nil
+}
+
+func (h *hookNFT) Cleanup(_ context.Context) error { return nil }
+
+func TestConcurrentReloadFromFileAppliesLatestDiskSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+
+	probeLn, _ := net.Listen("tcp4", "127.0.0.1:0")
+	proxyPort := probeLn.Addr().(*net.TCPAddr).Port
+	_ = probeLn.Close()
+
+	baseCfg := &config.Config{
+		LANInterface:      "eth0",
+		IngressInterfaces: []string{"wg0"},
+		ProxyPort:         proxyPort,
+		WakeTimeout:       config.Duration(20 * time.Second),
+		WakeCooldown:      config.Duration(time.Second),
+		PollInterval:      config.Duration(100 * time.Millisecond),
+		Clients:           map[string]config.Client{"laptop": {CIDR: "127.0.0.1/32"}},
+		Profiles:          map[string]config.Profile{"ssh": {Port: 22, Wake: config.WakeAuto}},
+		Targets: []config.Target{{
+			Name:     "pc1",
+			IP:       "192.168.0.21",
+			MAC:      "aa:bb:cc:dd:ee:01",
+			Profiles: []string{"ssh"},
+			Allow:    []string{"laptop"},
+		}},
+	}
+	if _, err := config.SaveAtomicChecked(cfgPath, baseCfg, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	inFirstReloadApply := make(chan struct{})
+	releaseFirstReloadApply := make(chan struct{})
+	nftHook := &hookNFT{
+		onApply: func(call int, _ string) {
+			// call == 1 is initial Start(); call == 2 is first ReloadFromFile()
+			if call == 2 {
+				close(inFirstReloadApply)
+				<-releaseFirstReloadApply
+			}
+		},
+	}
+
+	srv := NewServer(Options{
+		ConfigPath: cfgPath,
+		Interfaces: testProxyInterfaces(),
+		NFT:        nftHook,
+		WoLSender:  &fakeWoLSender{},
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx, baseCfg); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	// Write v1 to disk and start first ReloadFromFile (which pauses inside NFT.Apply while holding lifecycleMu).
+	v1 := baseCfg.Clone()
+	v1.WakeTimeout = config.Duration(45 * time.Second)
+	v1.Targets = append(v1.Targets, config.Target{
+		Name:     "pc2",
+		IP:       "192.168.0.22",
+		MAC:      "aa:bb:cc:dd:ee:02",
+		Profiles: []string{"ssh"},
+		Allow:    []string{"laptop"},
+	})
+	if _, err := config.SaveAtomicChecked(cfgPath, v1, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 2)
+	go func() {
+		errCh <- srv.ReloadFromFile(context.Background())
+	}()
+
+	<-inFirstReloadApply
+
+	// Start second ReloadFromFile BEFORE updating disk to v2? No: update disk to v2 while first holds lifecycleMu,
+	// AND verify second ReloadFromFile reads v2 AFTER acquiring lifecycleMu (never reading stale v1 early if queued),
+	// plus verify order of rulesets!
+	// Even stronger: launch goroutine 2 BEFORE updating disk? Wait: if goroutine 2 blocks on lifecycleMu BEFORE config.Load,
+	// then updating disk to v2 WHILE goroutine 2 is waiting on lifecycleMu means goroutine 2 WILL read v2 once unblocked —
+	// whereas WITHOUT lifecycleMu around config.Load, goroutine 2 would have ALREADY read stale v1 before blocking on reloadMu!
+	r2Started := make(chan struct{})
+	go func() {
+		close(r2Started)
+		errCh <- srv.ReloadFromFile(context.Background())
+	}()
+	<-r2Started
+	// Give goroutine 2 a moment to reach lifecycleMu.Lock() (if config.Load were outside lifecycleMu, it would read v1 right here!)
+	time.Sleep(25 * time.Millisecond)
+
+	v2 := v1.Clone()
+	v2.WakeTimeout = config.Duration(95 * time.Second)
+	v2.Targets = append(v2.Targets, config.Target{
+		Name:     "pc3",
+		IP:       "192.168.0.23",
+		MAC:      "aa:bb:cc:dd:ee:03",
+		Profiles: []string{"ssh"},
+		Allow:    []string{"laptop"},
+	})
+	if _, err := config.SaveAtomicChecked(cfgPath, v2, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	close(releaseFirstReloadApply)
+
+	for i := 0; i < 2; i++ {
+		if rErr := <-errCh; rErr != nil {
+			t.Fatalf("ReloadFromFile %d failed: %v", i+1, rErr)
+		}
+	}
+
+	// Because config.Load runs inside lifecycleMu, the queued ReloadFromFile MUST have read v2!
+	srv.connsMu.Lock()
+	gotWakeTimeout := srv.curState.wakeTimeout
+	_, hasPC3 := srv.curState.routes[netip.MustParseAddrPort("192.168.0.23:22")]
+	srv.connsMu.Unlock()
+
+	if !hasPC3 || gotWakeTimeout != 95*time.Second {
+		t.Fatalf("expected queued ReloadFromFile to load latest v2 after acquiring lifecycleMu, got hasPC3=%v wakeTimeout=%v", hasPC3, gotWakeTimeout)
+	}
+
+	nftHook.mu.Lock()
+	finalRuleset := nftHook.rulesets[len(nftHook.rulesets)-1]
+	applyCountBeforeShutdown := len(nftHook.rulesets)
+	nftHook.mu.Unlock()
+	if !strings.Contains(finalRuleset, "192.168.0.23 . 22") {
+		t.Fatalf("expected final nft ruleset to include pc3 from v2:\n%s", finalRuleset)
+	}
+
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.ReloadFromFile(context.Background()); err == nil {
+		t.Fatal("expected ReloadFromFile after Shutdown to fail")
+	}
+	nftHook.mu.Lock()
+	applyCountAfter := len(nftHook.rulesets)
+	nftHook.mu.Unlock()
+	if applyCountAfter != applyCountBeforeShutdown {
+		t.Fatalf("post-shutdown ReloadFromFile touched NFT: %d -> %d", applyCountBeforeShutdown, applyCountAfter)
 	}
 }

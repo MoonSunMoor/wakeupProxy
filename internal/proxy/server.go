@@ -85,6 +85,14 @@ type compiledState struct {
 	routes            map[netip.AddrPort]*routeEntry
 }
 
+func trimStrings(in []string) []string {
+	out := make([]string, len(in))
+	for i, s := range in {
+		out[i] = strings.TrimSpace(s)
+	}
+	return out
+}
+
 func compileState(
 	cfg *config.Config,
 	ifaces netutil.Provider,
@@ -97,9 +105,17 @@ func compileState(
 	if len(rep.Errors) > 0 {
 		return nil, rep.Warnings, rep.Errors
 	}
+	st, err := buildCompiledState(cfg, ifaces, prev)
+	return st, rep.Warnings, err
+}
 
-	lanName := cfg.LANInterface
-	ingNames := cfg.IngressInterfaces
+func buildCompiledState(
+	cfg *config.Config,
+	ifaces netutil.Provider,
+	prev *compiledState,
+) (*compiledState, error) {
+	lanName := strings.TrimSpace(cfg.LANInterface)
+	ingNames := trimStrings(cfg.IngressInterfaces)
 	proxyPort := cfg.ProxyPort
 
 	var lanSourceIP netip.Addr
@@ -108,18 +124,18 @@ func compileState(
 		if lanPrefix, ok := lanInfo.PrimaryPrefix(); ok {
 			bAddr, bErr := netutil.BroadcastAddr(lanPrefix)
 			if bErr != nil {
-				return nil, rep.Warnings, bErr
+				return nil, bErr
 			}
 			lanSourceIP = lanPrefix.Addr()
 			bcast = bAddr
 		}
 	}
 	if !bcast.IsValid() {
-		if prev != nil && prev.lanInterface == lanName && prev.lanBroadcast.IsValid() {
+		if prev != nil && strings.TrimSpace(prev.lanInterface) == lanName && prev.lanBroadcast.IsValid() {
 			lanSourceIP = prev.lanSourceIP
 			bcast = prev.lanBroadcast
 		} else {
-			return nil, rep.Warnings, fmt.Errorf("LAN 인터페이스(%s)에 IPv4 서브넷이 없습니다", lanName)
+			return nil, fmt.Errorf("LAN 인터페이스(%s)에 IPv4 서브넷이 없습니다", lanName)
 		}
 	}
 
@@ -127,7 +143,7 @@ func compileState(
 	for name, cl := range cfg.Clients {
 		pfx, err := netutil.ParseIPv4OrCIDR(cl.CIDR)
 		if err != nil {
-			return nil, rep.Warnings, err
+			return nil, err
 		}
 		compiledClients[name] = compiledClient{name: name, prefix: pfx}
 	}
@@ -136,18 +152,18 @@ func compileState(
 	for _, t := range cfg.Targets {
 		tIP, err := netutil.ParseIPv4Host(t.IP)
 		if err != nil {
-			return nil, rep.Warnings, err
+			return nil, err
 		}
 		_, macHW, err := netutil.NormalizeMAC(t.MAC)
 		if err != nil {
-			return nil, rep.Warnings, err
+			return nil, err
 		}
 		var aliasIP netip.Addr
 		hasAlias := strings.TrimSpace(t.Alias) != ""
 		if hasAlias {
 			aliasIP, err = netutil.ParseIPv4Host(t.Alias)
 			if err != nil {
-				return nil, rep.Warnings, err
+				return nil, err
 			}
 		}
 
@@ -187,8 +203,12 @@ func compileState(
 		}
 	}
 
+	normalizedCfg := cfg.Clone()
+	normalizedCfg.LANInterface = lanName
+	normalizedCfg.IngressInterfaces = append([]string(nil), ingNames...)
+
 	return &compiledState{
-		cfg:               cfg.Clone(),
+		cfg:               normalizedCfg,
 		lanInterface:      lanName,
 		lanSourceIP:       lanSourceIP,
 		lanBroadcast:      bcast,
@@ -198,7 +218,7 @@ func compileState(
 		wakeCooldown:      cfg.WakeCooldown.Std(),
 		pollInterval:      cfg.PollInterval.Std(),
 		routes:            routes,
-	}, rep.Warnings, nil
+	}, nil
 }
 
 type connPhase uint8
@@ -671,14 +691,13 @@ func checkNoRestartRequiredChanges(cur *compiledState, newCfg *config.Config) er
 		return nil
 	}
 	var changed []string
-	if strings.TrimSpace(newCfg.LANInterface) != "" && newCfg.LANInterface != cur.lanInterface {
+	if strings.TrimSpace(newCfg.LANInterface) != strings.TrimSpace(cur.lanInterface) {
 		changed = append(changed, "lan_interface")
 	}
-	if len(newCfg.IngressInterfaces) > 0 && hasValidIngressSlice(newCfg.IngressInterfaces) &&
-		!slices.Equal(newCfg.IngressInterfaces, cur.ingressInterfaces) {
+	if !slices.Equal(trimStrings(newCfg.IngressInterfaces), trimStrings(cur.ingressInterfaces)) {
 		changed = append(changed, "ingress_interfaces")
 	}
-	if newCfg.ProxyPort >= 1 && newCfg.ProxyPort <= 65535 && newCfg.ProxyPort != cur.proxyPort {
+	if newCfg.ProxyPort != cur.proxyPort {
 		changed = append(changed, "proxy_port")
 	}
 	if len(changed) == 0 {
@@ -690,36 +709,64 @@ func checkNoRestartRequiredChanges(cur *compiledState, newCfg *config.Config) er
 	)
 }
 
-func hasValidIngressSlice(names []string) bool {
-	seen := make(map[string]bool, len(names))
-	for _, raw := range names {
-		n := strings.TrimSpace(raw)
-		if n == "" || seen[n] {
-			return false
-		}
-		seen[n] = true
-	}
-	return true
-}
-
-// Reload validates and applies a new Config transactionally (SIGHUP / synchronous reload):
-// - Explicitly rejects changes to lan_interface, ingress_interfaces, or proxy_port (requires restart).
-// - Phase 1 (Prepare): binds only newly added ingress IPv4 listener addresses.
-// - Phase 2 (Apply): builds and applies the nftables ruleset; on error, closes only newly bound
-//   listeners and preserves existing listeners, curState, and active connections intact.
-// - Phase 3 (Commit): swaps curState, registers & starts new listeners, closes stale listeners,
-//   and evicts connections that are no longer authorized for their current phase (waking vs relaying).
-func (s *Server) Reload(ctx context.Context, newCfg *config.Config) error {
-	s.lifecycleMu.Lock()
-	defer s.lifecycleMu.Unlock()
-
+func (s *Server) currentRunningState() (*compiledState, error) {
 	s.connsMu.Lock()
 	cur := s.curState
 	closing := s.closing
 	s.connsMu.Unlock()
-
 	if !s.started || s.stopped || closing || cur == nil {
-		return errors.New("서버가 실행 중이 아닙니다")
+		return nil, errors.New("서버가 실행 중이 아닙니다")
+	}
+	return cur, nil
+}
+
+// Reload validates and applies a new Config transactionally (SIGHUP / synchronous reload):
+//   - Validates newCfg first; on validation errors, keeps previous config and returns them.
+//   - Explicitly rejects changes to lan_interface, ingress_interfaces, or proxy_port (requires restart).
+//   - Phase 1 (Prepare): binds only newly added ingress IPv4 listener addresses.
+//   - Phase 2 (Apply): builds and applies the nftables ruleset; on error, closes only newly bound
+//     listeners and preserves existing listeners, curState, and active connections intact.
+//   - Phase 3 (Commit): swaps curState, registers & starts new listeners, closes stale listeners,
+//     and evicts connections that are no longer authorized for their current phase (waking vs relaying).
+func (s *Server) Reload(ctx context.Context, newCfg *config.Config) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	return s.reloadLocked(ctx, newCfg)
+}
+
+// ReloadFromFile reads opts.ConfigPath and applies it atomically under lifecycleMu
+// so concurrent SIGHUP / control-socket reloads cannot apply a stale pre-read snapshot.
+func (s *Server) ReloadFromFile(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	if _, err := s.currentRunningState(); err != nil {
+		return err
+	}
+
+	cfg, _, err := config.Load(s.opts.ConfigPath)
+	if err != nil {
+		s.opts.Logger.Error("설정 파일 읽기 실패 (기존 설정 유지)", "path", s.opts.ConfigPath, "error", err)
+		return err
+	}
+	return s.reloadLocked(ctx, cfg)
+}
+
+func (s *Server) reloadLocked(ctx context.Context, newCfg *config.Config) error {
+	cur, err := s.currentRunningState()
+	if err != nil {
+		return err
+	}
+
+	rep := config.ValidateWithOptions(newCfg, s.opts.Interfaces, config.ValidateOptions{
+		StrictInterfaces: false,
+	})
+	for _, w := range rep.Warnings {
+		s.opts.Logger.Warn("설정 재적재 검증 경고", "detail", w.Error())
+	}
+	if len(rep.Errors) > 0 {
+		s.opts.Logger.Error("설정 재적재 실패 (기존 설정 유지)", "error", rep.Errors)
+		return rep.Errors
 	}
 
 	if err := checkNoRestartRequiredChanges(cur, newCfg); err != nil {
@@ -735,10 +782,7 @@ func (s *Server) Reload(ctx context.Context, newCfg *config.Config) error {
 		return err
 	}
 
-	next, warns, err := compileState(newCfg, s.opts.Interfaces, false, cur)
-	for _, w := range warns {
-		s.opts.Logger.Warn("설정 재적재 검증 경고", "detail", w.Error())
-	}
+	next, err := buildCompiledState(newCfg, s.opts.Interfaces, cur)
 	if err != nil {
 		s.opts.Logger.Error("설정 재적재 실패 (기존 설정 유지)", "error", err)
 		return err
@@ -786,16 +830,6 @@ func (s *Server) Reload(ctx context.Context, newCfg *config.Config) error {
 		"closed_connections", len(revoked),
 	)
 	return nil
-}
-
-// ReloadFromFile reads opts.ConfigPath and calls Reload.
-func (s *Server) ReloadFromFile(ctx context.Context) error {
-	cfg, _, err := config.Load(s.opts.ConfigPath)
-	if err != nil {
-		s.opts.Logger.Error("설정 파일 읽기 실패 (기존 설정 유지)", "path", s.opts.ConfigPath, "error", err)
-		return err
-	}
-	return s.Reload(ctx, cfg)
 }
 
 func isRelayingConnAuthorized(st *compiledState, tc *trackedConn) bool {

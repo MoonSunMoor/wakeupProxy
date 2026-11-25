@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -389,7 +390,11 @@ func serveWithOptions(cfgPath string, stderr io.Writer, opts proxy.Options, sigC
 		logger.Warn("런타임 상태 파일 기록 불가 (비관리 실행 모드)", "dir", rtDir, "error", stateErr)
 	}
 
+	var reloadOpMu sync.Mutex
 	doReload := func(rCtx context.Context) error {
+		reloadOpMu.Lock()
+		defer reloadOpMu.Unlock()
+
 		_ = daemon.NotifyReloading()
 		err := srv.ReloadFromFile(rCtx)
 		if err == nil {
