@@ -3,10 +3,13 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/MoonSunMoor/wakeupProxy/internal/config"
+	"github.com/MoonSunMoor/wakeupProxy/internal/daemon"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -145,7 +148,31 @@ func (m *Model) writeFileAndProceedToApply(forceOverwrite bool) (tea.Model, tea.
 		HasUserComments: false,
 	}
 
-	reasons := m.computeRestartReasons()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	st := m.deps.Service.Status(ctx)
+	cancel()
+
+	expectedCfgPath := config.DefaultConfigPath
+	if st.Active && st.HasRuntimeState && strings.TrimSpace(st.ConfigPath) != "" {
+		expectedCfgPath = st.ConfigPath
+	}
+	if !daemon.SameConfigPath(m.deps.ConfigPath, expectedCfgPath) {
+		m.restartReasons = nil
+		m.statusLine = "설정 파일만 저장 완료 (서비스 설정 경로와 달라 적용 생략)"
+		m.showNotice(
+			"설정 파일만 저장됨",
+			fmt.Sprintf(
+				"설정 파일(%s)을 저장했습니다.\n기본/실행 중 서비스 설정 경로(%s)가 아니므로 systemctl 적용은 생략했습니다.",
+				m.deps.ConfigPath,
+				expectedCfgPath,
+			),
+			false,
+			screenList,
+		)
+		return m, nil
+	}
+
+	reasons := m.computeRestartReasonsFromStatus(st)
 	if len(reasons) > 0 {
 		m.restartReasons = reasons
 		m.screen = screenConfirmRestart
@@ -157,13 +184,9 @@ func (m *Model) writeFileAndProceedToApply(forceOverwrite bool) (tea.Model, tea.
 	return m, m.runServiceActionCmd("reload")
 }
 
-// computeRestartReasons checks whether an active running daemon has bound different
+// computeRestartReasonsFromStatus checks whether an active running daemon has bound different
 // lan_interface, ingress_interfaces, or proxy_port values from m.cfg.
-func (m *Model) computeRestartReasons() []string {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	st := m.deps.Service.Status(ctx)
-
+func (m *Model) computeRestartReasonsFromStatus(st DaemonStatus) []string {
 	if !st.Active {
 		// Service is stopped: Reload() will start it fresh without dropping existing connections.
 		return nil

@@ -23,7 +23,8 @@ WireGuard VPN 등 신뢰된 유입 인터페이스로 들어오는 TCP 연결 �
   - 프로파일별 `idle_timeout` / `idle_bytes` 정책으로 유휴 연결을 자동 종료할 수 있습니다(유휴 추적 활성화 시 바이트 집계를 위해 사용자 공간 복사로 전환되어 `splice` 최적화는 적용되지 않습니다).
 - **기본 거부(Default-Deny) 접근 제어와 동기식 무중단 재적재**
   - 가로채는 프로파일 포트에 대해 타깃마다 허용된 클라이언트(`allow`, IP/CIDR)만 접속할 수 있으며, 허용 목록 밖 출발지는 매직 패킷을 보내지 않고 즉시 닫습니다.
-  - `systemd` `Type=notify` 및 제어 소켓(`/run/wolproxy/control.sock`) 기반 `systemctl reload wolproxy`로 실제 검증·`nftables` 적용 성공 여부를 동기식으로 확인하며, 유효한 기존 연결은 유지하되 권한이 회수되거나 삭제·변경된 타깃·프로파일의 연결은 즉시 종료합니다.
+  - `systemd` `Type=notify` 및 제어 소켓(`/run/wolproxy/control.sock`) 기반 `systemctl reload wolproxy`로 실제 검증·`nftables` 적용 성공 여부를 트랜잭션 단위로 확인합니다(적용 실패나 `lan_interface`·`ingress_interfaces`·`proxy_port` 변경 시에는 부분 적용 없이 거부하고 기존 리스너와 설정을 그대로 유지합니다).
+  - 재적재 시 이미 중계 중인 연결은 목적지 `(타깃 IP, 포트, 별칭 여부)`와 `allow` 허용이 유효하면 타깃·프로파일 이름 변경, MAC 수정, `wake` 정책 변경에도 끊기지 않으며, 깨우기 대기 중인 연결은 타깃 삭제·포트 제거·`allow` 회수·IP/MAC 변경·`wake: never` 전환 시 즉시 중단됩니다.
 - **내장 TUI 설정 편집기 (Bubble Tea + Huh)**
   - `sudo wolproxy` 실행만으로 타깃·클라이언트·프로파일·전역 설정 편집, LAN ARP 기기 검색(`Ctrl+L`), MAC 자동 채우기, 검증 오류 위치 점프, 백업(`.bak`) 및 서비스 적용까지 한 번에 처리합니다.
 - **최소 권한 실행**
@@ -194,7 +195,7 @@ targets:
 
 ### CLI 명령어
 
-모든 명령에 `-c <경로>` 옵션으로 설정 파일 경로를 지정할 수 있습니다(기본값: `/etc/wolproxy/config.yaml`).
+모든 명령에 `-c <경로>` 옵션으로 설정 파일 경로를 지정할 수 있습니다(기본값: `/etc/wolproxy/config.yaml`). TUI에서 실행 중 서비스(또는 중지 상태일 때 기본 `/etc/wolproxy/config.yaml`)와 다른 경로를 편집하면 파일만 저장하고 `systemctl` 서비스 적용은 생략하며, `wolproxy reload -c <경로>`에서 실행 중 데몬의 설정 경로와 다른 경로를 지정하면 오류를 반환합니다.
 
 | 명령 | 설명 |
 | --- | --- |
@@ -236,7 +237,7 @@ sudo journalctl -u wolproxy -f
 sudo wolproxy check
 sudo systemctl reload wolproxy
 
-# lan_interface, ingress_interfaces, proxy_port 변경 시 재시작
+# lan_interface, ingress_interfaces, proxy_port 변경 시 (reload는 명시적 거부하므로 재시작 필요)
 sudo systemctl restart wolproxy
 
 # 현재 적용된 nftables 가로채기 규칙 확인

@@ -17,6 +17,7 @@ import (
 type DaemonStatus struct {
 	Active            bool
 	HasRuntimeState   bool
+	ConfigPath        string
 	LANInterface      string
 	IngressInterfaces []string
 	ProxyPort         int
@@ -61,6 +62,7 @@ func (m SystemdManager) Status(ctx context.Context) DaemonStatus {
 		return DaemonStatus{
 			Active:            true,
 			HasRuntimeState:   true,
+			ConfigPath:        rt.ConfigPath,
 			LANInterface:      rt.LANInterface,
 			IngressInterfaces: append([]string(nil), rt.IngressInterfaces...),
 			ProxyPort:         rt.ProxyPort,

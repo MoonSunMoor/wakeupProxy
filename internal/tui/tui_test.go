@@ -111,6 +111,7 @@ targets:
 		status: DaemonStatus{
 			Active:            true,
 			HasRuntimeState:   true,
+			ConfigPath:        cfgPath,
 			LANInterface:      "eth0",
 			IngressInterfaces: []string{"wg0"},
 			ProxyPort:         13389,
@@ -425,5 +426,68 @@ func TestSaveAllowsMissingIngressInterfaceWithWarning(t *testing.T) {
 	m = next.(*Model)
 	if svc.reloads != 1 {
 		t.Fatalf("expected save+reload to succeed while wg0 is down, got reloads=%d", svc.reloads)
+	}
+}
+
+func TestSaveSkipsServiceApplyWhenConfigPathDiffersFromDaemonOrDefault(t *testing.T) {
+	// 1. Active daemon running with /etc/wolproxy/config.yaml while TUI edits a custom -c path
+	m, cfgPath, svc, _, _ := setupTestModel(t, true)
+	svc.status.ConfigPath = config.DefaultConfigPath
+	m.cfg.ProxyPort = 14500 // Even changing restart-required field must NOT trigger restart prompt!
+
+	m, _ = sendKey(m, "s")
+	if m.screen != screenSaveSummary {
+		t.Fatalf("expected screenSaveSummary, got %v", m.screen)
+	}
+	m, cmd := sendKey(m, "y")
+	if cmd != nil {
+		t.Fatal("expected nil service command when editing non-service config path")
+	}
+	if svc.reloads != 0 || svc.restarts != 0 {
+		t.Fatalf("expected 0 service calls for mismatched -c path, got reloads=%d restarts=%d", svc.reloads, svc.restarts)
+	}
+	if m.screen != screenNotice || !strings.Contains(m.noticeBody, "생략") {
+		t.Fatalf("expected notice explaining service apply was skipped, got screen=%v body=%q", m.screen, m.noticeBody)
+	}
+	loaded, _, err := config.Load(cfgPath)
+	if err != nil || loaded.ProxyPort != 14500 {
+		t.Fatalf("expected custom config file saved with ProxyPort=14500, got %+v err=%v", loaded, err)
+	}
+	m, _ = sendKey(m, "enter")
+
+	// 2. Stopped daemon (or missing state.json) while TUI edits non-default path -> still skips systemctl start/reload!
+	svc.status = DaemonStatus{Active: false}
+	m.cfg.WakeTimeout = config.Duration(45 * time.Second)
+	m, _ = sendKey(m, "s")
+	m, cmd = sendKey(m, "y")
+	if cmd != nil || svc.reloads != 0 || svc.restarts != 0 {
+		t.Fatalf("expected stopped service with non-default -c path to skip systemctl apply, cmd=%v reloads=%d", cmd, svc.reloads)
+	}
+	m, _ = sendKey(m, "enter")
+
+	// 3. Relative path pointing to the SAME file as active daemon's ConfigPath -> applies via reload!
+	subDir := filepath.Join(filepath.Dir(cfgPath), "sub")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m.deps.ConfigPath = filepath.Join(subDir, "..", filepath.Base(cfgPath))
+	svc.status = DaemonStatus{
+		Active:            true,
+		HasRuntimeState:   true,
+		ConfigPath:        cfgPath,
+		LANInterface:      "eth0",
+		IngressInterfaces: []string{"wg0"},
+		ProxyPort:         14500,
+	}
+	m.cfg.WakeTimeout = config.Duration(60 * time.Second)
+	m, _ = sendKey(m, "s")
+	m, cmd = sendKey(m, "y")
+	if cmd == nil {
+		t.Fatal("expected reload command when normalized ConfigPath matches running daemon")
+	}
+	next, _ := m.Update(cmd())
+	m = next.(*Model)
+	if svc.reloads != 1 {
+		t.Fatalf("expected 1 reload when normalized ConfigPath matches, got %d", svc.reloads)
 	}
 }
