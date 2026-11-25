@@ -132,7 +132,7 @@ func (m *Model) writeFileAndProceedToApply(forceOverwrite bool) (tea.Model, tea.
 		metaCopy := m.meta
 		expected = &metaCopy
 	}
-	newModTime, err := config.SaveAtomicChecked(m.deps.ConfigPath, m.cfg, expected)
+	newModTime, syncWarn, err := config.SaveAtomicCheckedWithWarning(m.deps.ConfigPath, m.cfg, expected)
 	if err != nil {
 		if errors.Is(err, config.ErrExternalModification) {
 			m.screen = screenConfirmExternalOverwrite
@@ -140,6 +140,10 @@ func (m *Model) writeFileAndProceedToApply(forceOverwrite bool) (tea.Model, tea.
 		}
 		m.showNotice("설정 파일 저장 실패", err.Error(), true, screenList)
 		return m, nil
+	}
+	m.saveSyncWarn = ""
+	if syncWarn != nil {
+		m.saveSyncWarn = syncWarn.Error()
 	}
 	m.savedCfg = m.cfg.Clone()
 	m.meta = config.LoadMeta{
@@ -159,16 +163,15 @@ func (m *Model) writeFileAndProceedToApply(forceOverwrite bool) (tea.Model, tea.
 	if !daemon.SameConfigPath(m.deps.ConfigPath, expectedCfgPath) {
 		m.restartReasons = nil
 		m.statusLine = "설정 파일만 저장 완료 (서비스 설정 경로와 달라 적용 생략)"
-		m.showNotice(
-			"설정 파일만 저장됨",
-			fmt.Sprintf(
-				"설정 파일(%s)을 저장했습니다.\n기본/실행 중 서비스 설정 경로(%s)가 아니므로 systemctl 적용은 생략했습니다.",
-				m.deps.ConfigPath,
-				expectedCfgPath,
-			),
-			false,
-			screenList,
+		body := fmt.Sprintf(
+			"설정 파일(%s)을 저장했습니다.\n기본/실행 중 서비스 설정 경로(%s)가 아니므로 systemctl 적용은 생략했습니다.",
+			m.deps.ConfigPath,
+			expectedCfgPath,
 		)
+		if warn := m.consumeSaveSyncWarn(); warn != "" {
+			body += "\n\n⚠ 경고: " + warn
+		}
+		m.showNotice("설정 파일만 저장됨", body, false, screenList)
 		return m, nil
 	}
 
@@ -215,7 +218,11 @@ func (m *Model) computeRestartReasonsFromStatus(st DaemonStatus) []string {
 func (m *Model) handleConfirmRestartKey(keyStr string) (tea.Model, tea.Cmd) {
 	if keyStr == "n" || keyStr == "N" || keyStr == "esc" {
 		m.screen = screenList
-		m.showNotice("설정 파일만 저장됨", "설정 파일은 저장되었으나 서비스 재시작을 취소했습니다.\n변경 사항을 반영하려면 추후 systemctl restart wolproxy를 실행하세요.", false, screenList)
+		body := "설정 파일은 저장되었으나 서비스 재시작을 취소했습니다.\n변경 사항을 반영하려면 추후 systemctl restart wolproxy를 실행하세요."
+		if warn := m.consumeSaveSyncWarn(); warn != "" {
+			body += "\n\n⚠ 경고: " + warn
+		}
+		m.showNotice("설정 파일만 저장됨", body, false, screenList)
 		return m, nil
 	}
 	if keyStr == "y" || keyStr == "Y" || keyStr == "enter" {

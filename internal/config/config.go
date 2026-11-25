@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -18,6 +19,8 @@ const (
 	DefaultConfigPath = "/etc/wolproxy/config.yaml"
 	ManagedHeader     = "# 이 파일은 wolproxy TUI가 관리한다. 주석은 저장 시 사라지므로 메모는 note에 쓴다."
 
+	MinProxyPort        = 1024
+	MaxPort             = 65535
 	DefaultProxyPort    = 13389
 	DefaultWakeTimeout  = 120 * time.Second
 	DefaultWakeCooldown = 10 * time.Second
@@ -516,6 +519,15 @@ func CheckExternalModification(path string, meta LoadMeta) (bool, error) {
 	return !st.ModTime().Equal(meta.ModTime), nil
 }
 
+var syncDirFn = syncDir
+
+func isIgnorableDirSyncError(err error) bool {
+	return errors.Is(err, syscall.EINVAL) ||
+		errors.Is(err, syscall.ENOTSUP) ||
+		errors.Is(err, syscall.EOPNOTSUPP) ||
+		errors.Is(err, syscall.EBADF)
+}
+
 // SaveAtomic backs up any existing config file to path+".bak", writes the managed
 // YAML to a sibling temporary file with mode 0644 (readable by wolproxy user),
 // renames it into place, and fsyncs the parent directory.
@@ -526,23 +538,32 @@ func SaveAtomic(path string, cfg *Config) (time.Time, error) {
 // SaveAtomicChecked performs SaveAtomic while verifying expected LoadMeta (when non-nil)
 // immediately before backing up and renaming, preventing silent overwrite races.
 func SaveAtomicChecked(path string, cfg *Config, expected *LoadMeta) (time.Time, error) {
+	modTime, _, err := SaveAtomicCheckedWithWarning(path, cfg, expected)
+	return modTime, err
+}
+
+// SaveAtomicCheckedWithWarning performs SaveAtomicChecked and additionally surfaces any
+// non-ignorable directory fsync I/O failure after os.Rename succeeds as a warning rather
+// than a fatal save error (since the target file has already been atomically replaced).
+// Filesystem-unsupported directory fsync errors (EINVAL, ENOTSUP, EOPNOTSUPP, EBADF) are ignored.
+func SaveAtomicCheckedWithWarning(path string, cfg *Config, expected *LoadMeta) (time.Time, error, error) {
 	encoded, err := Marshal(cfg)
 	if err != nil {
-		return time.Time{}, err
+		return time.Time{}, nil, err
 	}
 
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return time.Time{}, fmt.Errorf("설정 디렉터리 생성 실패: %w", err)
+		return time.Time{}, nil, fmt.Errorf("설정 디렉터리 생성 실패: %w", err)
 	}
 
 	if expected != nil {
 		changed, err := CheckExternalModification(path, *expected)
 		if err != nil {
-			return time.Time{}, err
+			return time.Time{}, nil, err
 		}
 		if changed {
-			return time.Time{}, ErrExternalModification
+			return time.Time{}, nil, ErrExternalModification
 		}
 	}
 
@@ -556,12 +577,12 @@ func SaveAtomicChecked(path string, cfg *Config, expected *LoadMeta) (time.Time,
 			perm = st.Mode().Perm()
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return time.Time{}, fmt.Errorf("기존 설정 파일 읽기 실패: %w", err)
+		return time.Time{}, nil, fmt.Errorf("기존 설정 파일 읽기 실패: %w", err)
 	}
 
 	tmpFile, err := os.CreateTemp(dir, ".config.yaml.tmp-*")
 	if err != nil {
-		return time.Time{}, fmt.Errorf("임시 파일 생성 실패: %w", err)
+		return time.Time{}, nil, fmt.Errorf("임시 파일 생성 실패: %w", err)
 	}
 	tmpPath := tmpFile.Name()
 	cleanup := true
@@ -573,50 +594,53 @@ func SaveAtomicChecked(path string, cfg *Config, expected *LoadMeta) (time.Time,
 
 	if _, err := tmpFile.Write(encoded); err != nil {
 		_ = tmpFile.Close()
-		return time.Time{}, fmt.Errorf("임시 파일 쓰기 실패: %w", err)
+		return time.Time{}, nil, fmt.Errorf("임시 파일 쓰기 실패: %w", err)
 	}
 	if err := tmpFile.Chmod(perm); err != nil {
 		_ = tmpFile.Close()
-		return time.Time{}, fmt.Errorf("파일 권한 설정 실패: %w", err)
+		return time.Time{}, nil, fmt.Errorf("파일 권한 설정 실패: %w", err)
 	}
 	if err := tmpFile.Sync(); err != nil {
 		_ = tmpFile.Close()
-		return time.Time{}, fmt.Errorf("파일 동기화 실패: %w", err)
+		return time.Time{}, nil, fmt.Errorf("파일 동기화 실패: %w", err)
 	}
 	if err := tmpFile.Close(); err != nil {
-		return time.Time{}, fmt.Errorf("임시 파일 닫기 실패: %w", err)
+		return time.Time{}, nil, fmt.Errorf("임시 파일 닫기 실패: %w", err)
 	}
 
 	// Re-verify mtime right before backup + atomic rename to narrow the TOCTOU window.
 	if expected != nil {
 		changed, err := CheckExternalModification(path, *expected)
 		if err != nil {
-			return time.Time{}, err
+			return time.Time{}, nil, err
 		}
 		if changed {
-			return time.Time{}, ErrExternalModification
+			return time.Time{}, nil, ErrExternalModification
 		}
 	}
 
 	if hadPrev {
 		bakPath := path + ".bak"
 		if err := writeFileSynced(bakPath, prevData, perm); err != nil {
-			return time.Time{}, fmt.Errorf("백업 파일(%s) 저장 실패: %w", bakPath, err)
+			return time.Time{}, nil, fmt.Errorf("백업 파일(%s) 저장 실패: %w", bakPath, err)
 		}
 	}
 
 	if err := os.Rename(tmpPath, path); err != nil {
-		return time.Time{}, fmt.Errorf("설정 파일 교체 실패: %w", err)
+		return time.Time{}, nil, fmt.Errorf("설정 파일 교체 실패: %w", err)
 	}
 	cleanup = false
 
-	_ = syncDir(dir)
+	var syncWarn error
+	if dErr := syncDirFn(dir); dErr != nil && !isIgnorableDirSyncError(dErr) {
+		syncWarn = fmt.Errorf("설정 디렉터리 동기화(fsync) 실패: %w", dErr)
+	}
 
 	st, err := os.Stat(path)
 	if err != nil {
-		return time.Time{}, nil
+		return time.Time{}, syncWarn, nil
 	}
-	return st.ModTime(), nil
+	return st.ModTime(), syncWarn, nil
 }
 
 func writeFileSynced(path string, data []byte, perm os.FileMode) error {

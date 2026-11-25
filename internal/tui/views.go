@@ -437,7 +437,7 @@ func (m *Model) renderHelpModal() string {
   Ctrl+L           타깃 폼에서 LAN ARP 기기 검색 (root 전용, /22 이하)
 
   [공통]
-  s / Ctrl+S       설정 검증 → 변경 요약 → 백업·저장 → systemd 적용
+  s / Ctrl+S       설정 검증 → 변경 요약 → 백업·저장 → systemd 적용 (폼 안에서는 Ctrl+S)
   Esc              폼 취소(변경 버림) 또는 대화상자 닫기
   ?                도움말 열기/닫기
   q                종료 (저장하지 않은 변경이 있으면 확인)`

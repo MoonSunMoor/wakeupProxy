@@ -65,11 +65,13 @@ func (a *fakeARP) ScanSubnet(_ context.Context, _ netutil.InterfaceInfo) ([]arp.
 }
 
 type fakeWoL struct {
-	sent int
+	sent      int
+	lastBcast netip.Addr
 }
 
-func (w *fakeWoL) SendMagicPacket(_ context.Context, _ netip.Addr, _ net.HardwareAddr) error {
+func (w *fakeWoL) SendMagicPacket(_ context.Context, bcast netip.Addr, _ net.HardwareAddr) error {
 	w.sent++
+	w.lastBcast = bcast
 	return nil
 }
 
@@ -331,6 +333,9 @@ func TestWakeStatusAndLANScanPopulateForm(t *testing.T) {
 	if m.screen != screenTargetForm || m.tDraft.ip != "192.168.0.55" || m.tDraft.mac != "aa:bb:cc:dd:ee:55" {
 		t.Fatalf("expected LAN scan selection to populate IP and MAC, got %+v", m.tDraft)
 	}
+	if m.tDraft.name != "" {
+		t.Fatalf("expected LAN scan selection NOT to auto-fill target name from reverse DNS hostname, got %q", m.tDraft.name)
+	}
 }
 
 func TestProfilePresetPickerAndMACAutoFill(t *testing.T) {
@@ -353,16 +358,18 @@ func TestProfilePresetPickerAndMACAutoFill(t *testing.T) {
 	}
 	m, _ = sendKey(m, "esc")
 
-	// Test MAC auto-fill lookup command directly for 192.168.0.55
-	m, _ = sendKey(m, "1")
-	m, _ = sendKey(m, "a")
-	m.tDraft.name = "pc2"
-	m.tDraft.ip = "192.168.0.55"
-	cmd := m.lookupMACCmd("192.168.0.55", netip.MustParseAddr("192.168.0.55"))
-	next, _ := m.Update(cmd())
-	m = next.(*Model)
+	// Test MAC auto-fill when user types name + IP and tabs to MAC field -> preserves focus on "mac"
+	m = sendFormKey(m, "1")
+	m = sendFormKey(m, "a")
+	m = sendFormKey(m, "pc2")
+	m = sendFormKey(m, "tab") // name -> ip
+	m = sendFormKey(m, "192.168.0.55")
+	m = sendFormKey(m, "tab") // ip -> mac (triggers lookupMACCmd -> macLookupResultMsg -> rebuildTargetFormFocusing)
 	if m.tDraft.mac != "aa:bb:cc:dd:ee:55" {
 		t.Fatalf("expected MAC auto-fill to populate aa:bb:cc:dd:ee:55, got %q", m.tDraft.mac)
+	}
+	if focusedFieldKey(m.form) != "mac" {
+		t.Fatalf("expected focus preserved on 'mac' after rebuildTargetFormFocusing, got %q", focusedFieldKey(m.form))
 	}
 }
 
@@ -489,5 +496,239 @@ func TestSaveSkipsServiceApplyWhenConfigPathDiffersFromDaemonOrDefault(t *testin
 	m = next.(*Model)
 	if svc.reloads != 1 {
 		t.Fatalf("expected 1 reload when normalized ConfigPath matches, got %d", svc.reloads)
+	}
+}
+
+func runImmediateCmd(m *Model, cmd tea.Cmd, depth int) *Model {
+	if cmd == nil || depth > 8 {
+		return m
+	}
+	msgCh := make(chan tea.Msg, 1)
+	go func() {
+		msgCh <- cmd()
+	}()
+	var msg tea.Msg
+	select {
+	case msg = <-msgCh:
+	case <-time.After(25 * time.Millisecond):
+		// Skip long-lived timers such as cursor blink or periodic ARP ticks.
+		return m
+	}
+	if msg == nil {
+		return m
+	}
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		for _, sub := range batch {
+			m = runImmediateCmd(m, sub, depth+1)
+		}
+		return m
+	}
+	next, nextCmd := m.Update(msg)
+	m = next.(*Model)
+	return runImmediateCmd(m, nextCmd, depth+1)
+}
+
+func sendFormKey(m *Model, k string) *Model {
+	m, cmd := sendKey(m, k)
+	return runImmediateCmd(m, cmd, 0)
+}
+
+func TestFormBareSKeyDoesNotSaveWhileCtrlSSavesAcrossFieldTypes(t *testing.T) {
+	m, _, _, _, _ := setupTestModel(t, true)
+
+	// 1. Target Form MultiSelect ('profiles' and 'allow'): pressing 's' must NOT leave form or start save
+	m = sendFormKey(m, "enter") // edit pc1
+	if m.screen != screenTargetForm {
+		t.Fatalf("expected screenTargetForm, got %v", m.screen)
+	}
+	// Advance focus to MultiSelect 'profiles' (name -> ip -> mac -> alias -> profiles)
+	for i := 0; i < 4; i++ {
+		m = sendFormKey(m, "tab")
+	}
+	if got := focusedFieldKey(m.form); got != "profiles" {
+		t.Fatalf("expected focus on profiles MultiSelect, got %q", got)
+	}
+	m = sendFormKey(m, "s")
+	if m.screen != screenTargetForm {
+		t.Fatalf("expected bare 's' on MultiSelect to stay in screenTargetForm, got %v", m.screen)
+	}
+	m = sendFormKey(m, "tab")
+	if got := focusedFieldKey(m.form); got != "allow" {
+		t.Fatalf("expected focus on allow MultiSelect, got %q", got)
+	}
+	m = sendFormKey(m, "s")
+	if m.screen != screenTargetForm {
+		t.Fatalf("expected bare 's' on allow MultiSelect to stay in screenTargetForm, got %v", m.screen)
+	}
+
+	// 2. Global Form Select ('lan_interface'): pressing 's' must NOT start save; Ctrl+S MUST start save!
+	m = sendFormKey(m, "esc")
+	m = sendFormKey(m, "4")
+	m = sendFormKey(m, "enter")
+	if m.screen != screenGlobalForm || focusedFieldKey(m.form) != "lan_interface" {
+		t.Fatalf("expected screenGlobalForm focused on lan_interface Select, got screen=%v key=%q", m.screen, focusedFieldKey(m.form))
+	}
+	m = sendFormKey(m, "s")
+	if m.screen != screenGlobalForm {
+		t.Fatalf("expected bare 's' on Select field to stay in screenGlobalForm, got %v", m.screen)
+	}
+	m, _ = sendKey(m, "ctrl+s")
+	if m.screen != screenSaveSummary {
+		t.Fatalf("expected Ctrl+S inside form to commit form and open screenSaveSummary, got %v", m.screen)
+	}
+}
+
+func TestEmptyClientsTargetFormNoteAndBlackholeWarningInSaveSummary(t *testing.T) {
+	m, _, _, _, _ := setupTestModel(t, true)
+	// Clear all clients so starter/empty-clients state is active
+	m.cfg.Targets = nil
+	m.cfg.Clients = map[string]config.Client{}
+
+	m = sendFormKey(m, "a")
+	if m.screen != screenTargetForm {
+		t.Fatalf("expected screenTargetForm, got %v", m.screen)
+	}
+	view := m.View()
+	if !strings.Contains(view, "허용 클라이언트") || !strings.Contains(view, "등록된 클라이언트가 없어") {
+		t.Fatalf("expected target form to display empty-clients guidance note, got:\n%s", view)
+	}
+
+	// Fill valid target fields and step through all fields with Enter to verify Note does not block completion
+	m.tDraft.name = "pc-new"
+	m.tDraft.ip = "192.168.0.30"
+	m.tDraft.mac = "aa:bb:cc:dd:ee:30"
+	m.tDraft.profiles = []string{"rdp"}
+	m.form = m.buildTargetForm()
+	m = runImmediateCmd(m, m.form.Init(), 0)
+
+	// Fields: name -> ip -> mac -> alias -> profiles (MultiSelect) -> [allow Note skipped] -> note -> submit!
+	for step := 0; step < 8 && m.screen == screenTargetForm; step++ {
+		m = sendFormKey(m, "enter")
+	}
+	if m.screen != screenList {
+		t.Fatalf("expected target form with empty-clients Note to complete cleanly, stuck on screen=%v (focused=%q)", m.screen, focusedFieldKey(m.form))
+	}
+	if len(m.cfg.Targets) != 1 || m.cfg.Targets[0].Name != "pc-new" {
+		t.Fatalf("expected pc-new committed to memory config, got %+v", m.cfg.Targets)
+	}
+
+	// Press 's' -> Save Summary must warn about profiles with empty allow without blocking save!
+	m, _ = sendKey(m, "s")
+	if m.screen != screenSaveSummary {
+		t.Fatalf("expected screenSaveSummary (warning, not blocking error), got %v (errs=%v)", m.screen, m.valErrors)
+	}
+	if !strings.Contains(m.View(), "허용 클라이언트(allow)가 비어 있어") {
+		t.Fatalf("expected blackhole target warning in save summary, got:\n%s", m.View())
+	}
+}
+
+func TestGlobalFormRejectsLowProxyPortAndLANIngressOverlap(t *testing.T) {
+	if err := validateProxyPortStr("1023"); err == nil {
+		t.Fatal("expected proxy_port 1023 to be rejected by form validator")
+	}
+	if err := validateProxyPortStr("80"); err == nil {
+		t.Fatal("expected proxy_port 80 to be rejected by form validator")
+	}
+	if err := validateProxyPortStr("1024"); err != nil {
+		t.Fatalf("expected proxy_port 1024 to be accepted, got %v", err)
+	}
+
+	m, _, _, _, _ := setupTestModel(t, true)
+	m = sendFormKey(m, "4")
+	m = sendFormKey(m, "enter")
+	m.gDraft.lanInterface = "eth0"
+	m.gDraft.ingressInterfaces = []string{"eth0"}
+	m.form = m.buildGlobalForm()
+	m = runImmediateCmd(m, m.form.Init(), 0)
+	m = sendFormKey(m, "tab")   // focus ingress_interfaces
+	m = sendFormKey(m, "enter") // attempt to advance with lan_interface selected in ingress_interfaces
+	if len(m.form.Errors()) == 0 {
+		t.Fatal("expected Global Form ingress_interfaces validator to reject selecting lan_interface")
+	}
+}
+
+func TestTUIMultiSubnetWakeBroadcastSelection(t *testing.T) {
+	m, _, _, _, wolMock := setupTestModel(t, true)
+	m.deps.Interfaces = netutil.StaticProvider{
+		Items: []netutil.InterfaceInfo{
+			{
+				Name:         "eth0",
+				Index:        2,
+				HardwareAddr: net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
+				Prefixes: []netip.Prefix{
+					netip.MustParsePrefix("192.168.0.10/24"),
+					netip.MustParsePrefix("192.168.10.10/24"),
+				},
+				Up: true,
+			},
+			{
+				Name:     "wg0",
+				Index:    3,
+				Prefixes: []netip.Prefix{netip.MustParsePrefix("10.66.0.1/24")},
+				Up:       true,
+			},
+		},
+	}
+	m.cfg.Targets = append(m.cfg.Targets, config.Target{
+		Name:     "pc-sub2",
+		IP:       "192.168.10.50",
+		MAC:      "aa:bb:cc:dd:ee:50",
+		Profiles: []string{"rdp"},
+		Allow:    []string{"laptop"},
+	})
+	m.targetCursor = 1
+
+	m, cmd := sendKey(m, "w")
+	next, _ := m.Update(cmd())
+	m = next.(*Model)
+	if wolMock.lastBcast != netip.MustParseAddr("192.168.10.255") {
+		t.Fatalf("expected TUI 'w' on second-subnet target to send magic packet to 192.168.10.255, got %v", wolMock.lastBcast)
+	}
+
+	// Also verify TUI 't' port test binds matching second loopback subnet source IP when deps.Dial is nil
+	lnSub2, err := net.Listen("tcp4", "127.0.2.20:0")
+	if err == nil {
+		defer lnSub2.Close()
+		sub2Port := lnSub2.Addr().(*net.TCPAddr).Port
+		srcCh := make(chan string, 1)
+		go func() {
+			c, err := lnSub2.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			host, _, _ := net.SplitHostPort(c.RemoteAddr().String())
+			srcCh <- host
+		}()
+		m.deps.Interfaces = netutil.StaticProvider{
+			Items: []netutil.InterfaceInfo{
+				{
+					Name:  "eth0",
+					Index: 2,
+					Prefixes: []netip.Prefix{
+						netip.MustParsePrefix("127.0.1.10/24"),
+						netip.MustParsePrefix("127.0.2.10/24"),
+					},
+					Up: true,
+				},
+			},
+		}
+		m.cfg.Profiles["loop-prof"] = config.Profile{Port: sub2Port, Wake: config.WakeNever}
+		m.cfg.Targets = []config.Target{{
+			Name:     "loop-sub2",
+			IP:       "127.0.2.20",
+			MAC:      "aa:bb:cc:dd:ee:60",
+			Profiles: []string{"loop-prof"},
+			Allow:    []string{"laptop"},
+		}}
+		m.targetCursor = 0
+		_, tCmd := sendKey(m, "t")
+		tRes := tCmd().(portTestResultMsg)
+		if len(tRes.lines) != 1 || !strings.Contains(tRes.lines[0], "열림") {
+			t.Fatalf("expected port test open on 127.0.2.20:%d, got %v", sub2Port, tRes.lines)
+		}
+		if gotSrc := <-srcCh; gotSrc != "127.0.2.10" {
+			t.Fatalf("expected TUI 't' to bind second subnet source 127.0.2.10, got %s", gotSrc)
+		}
 	}
 }

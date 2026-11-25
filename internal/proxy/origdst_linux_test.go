@@ -52,6 +52,12 @@ func TestRealNFTablesRedirectAndOriginalDst(t *testing.T) {
 	ifaces := netutil.StaticProvider{
 		Items: []netutil.InterfaceInfo{
 			{
+				Name:     "eth0",
+				Index:    2,
+				Prefixes: []netip.Prefix{netip.MustParsePrefix("192.168.0.10/24")},
+				Up:       true,
+			},
+			{
 				Name:     "lo",
 				Index:    1,
 				Prefixes: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/8")},
@@ -61,7 +67,7 @@ func TestRealNFTablesRedirectAndOriginalDst(t *testing.T) {
 		},
 	}
 	cfg := &config.Config{
-		LANInterface:      "lo",
+		LANInterface:      "eth0",
 		IngressInterfaces: []string{"lo"},
 		ProxyPort:         proxyPort,
 		WakeTimeout:       config.Duration(2 * time.Second),
@@ -71,7 +77,8 @@ func TestRealNFTablesRedirectAndOriginalDst(t *testing.T) {
 		Profiles:          map[string]config.Profile{"echo": {Port: backendPort, Wake: config.WakeNever}},
 		Targets: []config.Target{{
 			Name:     "loop-target",
-			IP:       "127.0.0.2",
+			IP:       "192.168.0.21",
+			Alias:    "127.0.0.2",
 			MAC:      "02:00:00:00:00:02",
 			Profiles: []string{"echo"},
 			Allow:    []string{"local"},

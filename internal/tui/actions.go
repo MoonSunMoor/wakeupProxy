@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -156,10 +155,6 @@ func (m *Model) handleLANScanKey(keyStr string) (tea.Model, tea.Cmd) {
 		chosen := m.scanResults[m.modalCursor]
 		m.tDraft.ip = chosen.IP.String()
 		m.tDraft.mac = chosen.MAC
-		if strings.TrimSpace(m.tDraft.name) == "" && chosen.Hostname != "" {
-			short := strings.Split(chosen.Hostname, ".")[0]
-			m.tDraft.name = short
-		}
 		m.macAutoNote = "LAN 검색에서 선택됨"
 		m.form = m.buildTargetForm()
 		m.screen = screenTargetForm
@@ -183,7 +178,8 @@ func (m *Model) sendWakeForSelectedTarget() (tea.Model, tea.Cmd) {
 		m.showNotice("매직 패킷 송신 불가", fmt.Sprintf("LAN 인터페이스(%s) 조회 실패: %v", m.cfg.LANInterface, err), true, screenList)
 		return m, nil
 	}
-	pfx, ok := lanInfo.PrimaryPrefix()
+	targetIP, _ := netutil.ParseIPv4Host(t.IP)
+	pfx, ok := lanInfo.ResolvePrefix(targetIP)
 	if !ok {
 		m.showNotice("매직 패킷 송신 불가", fmt.Sprintf("LAN 인터페이스(%s)에 IPv4 서브넷이 없습니다", m.cfg.LANInterface), true, screenList)
 		return m, nil
@@ -228,8 +224,9 @@ func (m *Model) testPortsForSelectedTarget() (tea.Model, tea.Cmd) {
 	dialFn := m.deps.Dial
 	if dialFn == nil {
 		var lanIP netip.Addr
+		targetIP, _ := netutil.ParseIPv4Host(t.IP)
 		if lanInfo, err := m.deps.Interfaces.InterfaceByName(m.cfg.LANInterface); err == nil {
-			if pfx, ok := lanInfo.PrimaryPrefix(); ok {
+			if pfx, ok := lanInfo.ResolvePrefix(targetIP); ok {
 				lanIP = pfx.Addr()
 			}
 		}

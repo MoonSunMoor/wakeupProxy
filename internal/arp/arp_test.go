@@ -6,6 +6,8 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+
+	"github.com/MoonSunMoor/wakeupProxy/internal/netutil"
 )
 
 func TestBuildAndParseARPFrames(t *testing.T) {
@@ -59,5 +61,29 @@ func TestParseProcARP(t *testing.T) {
 	}
 	if entries[1].MAC != "" || entries[1].Flags != 0 {
 		t.Fatalf("expected incomplete entry to have empty MAC and flags=0: %+v", entries[1])
+	}
+}
+
+func TestSelectSourceIPMultiSubnet(t *testing.T) {
+	lanIface := netutil.InterfaceInfo{
+		Name:  "eth0",
+		Index: 2,
+		Prefixes: []netip.Prefix{
+			netip.MustParsePrefix("192.168.0.10/24"),
+			netip.MustParsePrefix("192.168.10.10/24"),
+		},
+	}
+
+	ip1, ok := SelectSourceIP(lanIface, netip.MustParseAddr("192.168.0.21"))
+	if !ok || ip1 != netip.MustParseAddr("192.168.0.10") {
+		t.Fatalf("expected 192.168.0.10 for first subnet target, got %v (ok=%v)", ip1, ok)
+	}
+	ip2, ok := SelectSourceIP(lanIface, netip.MustParseAddr("192.168.10.22"))
+	if !ok || ip2 != netip.MustParseAddr("192.168.10.10") {
+		t.Fatalf("expected 192.168.10.10 for second subnet target, got %v (ok=%v)", ip2, ok)
+	}
+	fallback, ok := SelectSourceIP(lanIface, netip.MustParseAddr("10.0.0.5"))
+	if !ok || fallback != netip.MustParseAddr("192.168.0.10") {
+		t.Fatalf("expected fallback to primary 192.168.0.10, got %v (ok=%v)", fallback, ok)
 	}
 }

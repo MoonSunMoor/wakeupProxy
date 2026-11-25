@@ -39,18 +39,22 @@ func isTextInputFocused(f *huh.Form) bool {
 	return ok
 }
 
-func (m *Model) rebuildTargetFormFocusing(targetKey string) {
+func (m *Model) rebuildTargetFormFocusing(targetKey string) tea.Cmd {
 	m.form = m.buildTargetForm()
-	_ = m.form.Init()
+	initCmd := m.form.Init()
 	if targetKey == "" {
-		return
+		return initCmd
 	}
-	for i := 0; i < 8; i++ {
+	cmds := []tea.Cmd{initCmd}
+	for i := 0; i < 12; i++ {
 		if focusedFieldKey(m.form) == targetKey {
 			break
 		}
-		_ = m.form.NextField()
+		if c := m.form.NextField(); c != nil {
+			cmds = append(cmds, c)
+		}
 	}
+	return tea.Batch(cmds...)
 }
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -372,8 +376,8 @@ func (m *Model) handleFormKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.startLANScan()
 	}
 
-	// Support saving directly from forms via Ctrl+S (or 's' when on non-text-input field)
-	if keyStr == "ctrl+s" || (keyStr == "s" && !isTextInputFocused(m.form)) {
+	// Support saving directly from forms only via Ctrl+S (never bare 's')
+	if keyStr == "ctrl+s" {
 		if err := m.commitCurrentFormIfValid(); err != nil {
 			m.showNotice("폼 입력 오류", err.Error(), true, m.screen)
 			return m, nil

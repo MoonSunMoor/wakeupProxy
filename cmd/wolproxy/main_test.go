@@ -36,21 +36,27 @@ func TestCheckCommandExitCodes(t *testing.T) {
 	if err != nil {
 		t.Skipf("cannot list system interfaces: %v", err)
 	}
-	var usable string
+	var usable []string
 	for _, info := range ifaces {
 		if len(info.Prefixes) > 0 {
-			usable = info.Name
-			break
+			usable = append(usable, info.Name)
 		}
 	}
-	if usable == "" {
+	if len(usable) == 0 {
 		t.Skip("no IPv4 interface available on host")
+	}
+	lanIface := usable[0]
+	ingIface := "nonexistent_wg0"
+	if len(usable) >= 2 {
+		ingIface = usable[1]
+	} else if lanIface == ingIface {
+		ingIface = "nonexistent_wg1"
 	}
 
 	dir := t.TempDir()
 	validPath := filepath.Join(dir, "valid.yaml")
-	validYAML := `lan_interface: ` + usable + `
-ingress_interfaces: [` + usable + `]
+	validYAML := `lan_interface: ` + lanIface + `
+ingress_interfaces: [` + ingIface + `]
 proxy_port: 13389
 clients:
   laptop: { cidr: 10.66.0.2/32 }
@@ -71,9 +77,26 @@ targets: []
 		t.Fatalf("expected check -c <path> to exit 0, got %d (%s)", code, stderr.String())
 	}
 
+	// Same interface in lan_interface and ingress_interfaces must fail check
+	sameIfacePath := filepath.Join(dir, "same_iface.yaml")
+	sameIfaceYAML := `lan_interface: ` + lanIface + `
+ingress_interfaces: [` + lanIface + `]
+proxy_port: 13389
+clients: {}
+profiles: {}
+targets: []
+`
+	if err := os.WriteFile(sameIfacePath, []byte(sameIfaceYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stderr.Reset()
+	if code := run([]string{"-c", sameIfacePath, "check"}, strings.NewReader(""), &stdout, &stderr, func() bool { return false }); code == 0 {
+		t.Fatal("expected check to exit non-zero when lan_interface equals ingress_interfaces")
+	}
+
 	// Missing interface (e.g. wg0 down) emits a warning and still exits 0 on check; omitted proxy_port defaults to 13389.
 	warnPath := filepath.Join(dir, "missing_wg0.yaml")
-	warnYAML := `lan_interface: ` + usable + `
+	warnYAML := `lan_interface: ` + lanIface + `
 ingress_interfaces: [nonexistent_wg99]
 clients: {}
 profiles: {}
@@ -317,5 +340,114 @@ targets: []
 	close(releaseCleanup)
 	if gotCode := <-doneCode; gotCode != 0 {
 		t.Fatalf("expected clean exit code 0 after SIGTERM, got %d", gotCode)
+	}
+}
+
+type recordedMagic struct {
+	bcast netip.Addr
+	mac   string
+}
+
+type recordingSender struct {
+	packets []recordedMagic
+}
+
+func (r *recordingSender) SendMagicPacket(_ context.Context, bcast netip.Addr, mac net.HardwareAddr) error {
+	r.packets = append(r.packets, recordedMagic{bcast: bcast, mac: mac.String()})
+	return nil
+}
+
+func TestRunWakeMultiSubnetBroadcastAndDialer(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "multi_subnet.yaml")
+	cfgYAML := `lan_interface: eth0
+ingress_interfaces: [wg0]
+proxy_port: 13389
+wake_timeout: 1s
+wake_cooldown: 500ms
+poll_interval: 20ms
+clients: {}
+profiles:
+  app: { port: ` + strings.TrimPrefix(net.JoinHostPort("", "0"), ":")[:0] + filepath.Base(net.JoinHostPort("x", string(rune('0'))))[:0] + func() string {
+		return strings.Split(ln.Addr().String(), ":")[1]
+	}() + `, wake: auto }
+targets:
+  - name: pc-sub1
+    ip: 192.168.0.21
+    mac: "aa:bb:cc:dd:ee:01"
+    profiles: [app]
+    allow: []
+  - name: pc-sub2
+    ip: 192.168.10.22
+    mac: "aa:bb:cc:dd:ee:02"
+    profiles: [app]
+    allow: []
+`
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ifaces := netutil.StaticProvider{
+		Items: []netutil.InterfaceInfo{
+			{
+				Name:  "eth0",
+				Index: 2,
+				Prefixes: []netip.Prefix{
+					netip.MustParsePrefix("192.168.0.10/24"),
+					netip.MustParsePrefix("192.168.10.10/24"),
+				},
+				Up: true,
+			},
+		},
+	}
+
+	sender := &recordingSender{}
+	dialedTargets := make(map[string]bool)
+	var stderr bytes.Buffer
+	code := runWakeWithDeps(
+		cfgPath,
+		[]string{"pc-sub1", "pc-sub2", "--wait"},
+		&stderr,
+		ifaces,
+		sender,
+		func(ctx context.Context, addr string) (net.Conn, error) {
+			host, _, _ := net.SplitHostPort(addr)
+			dialedTargets[host] = true
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strings.Split(ln.Addr().String(), ":")[1]))
+		},
+		nil,
+	)
+	_ = port
+	if code != 0 {
+		t.Fatalf("expected runWakeWithDeps exit 0, got %d (%s)", code, stderr.String())
+	}
+	if len(sender.packets) != 2 {
+		t.Fatalf("expected 2 magic packets, got %+v", sender.packets)
+	}
+	if sender.packets[0].bcast != netip.MustParseAddr("192.168.0.255") {
+		t.Fatalf("expected pc-sub1 broadcast 192.168.0.255, got %v", sender.packets[0].bcast)
+	}
+	if sender.packets[1].bcast != netip.MustParseAddr("192.168.10.255") {
+		t.Fatalf("expected pc-sub2 broadcast 192.168.10.255, got %v", sender.packets[1].bcast)
+	}
+	if !dialedTargets["192.168.0.21"] || !dialedTargets["192.168.10.22"] {
+		t.Fatalf("expected both targets polled during --wait, got %v", dialedTargets)
 	}
 }

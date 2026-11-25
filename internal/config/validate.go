@@ -114,16 +114,16 @@ func ValidateWithOptions(cfg *Config, ifaces netutil.Provider, opts ValidateOpti
 	}
 
 	// 1. Global settings
+	lanName := strings.TrimSpace(cfg.LANInterface)
 	var lanInfo netutil.InterfaceInfo
 	var hasLANInfo bool
-	if strings.TrimSpace(cfg.LANInterface) == "" {
+	if lanName == "" {
 		errs = append(errs, ValidationError{
 			Section: SectionGlobal,
 			Field:   "lan_interface",
 			Message: "LAN 인터페이스를 지정해야 합니다",
 		})
 	} else {
-		lanName := strings.TrimSpace(cfg.LANInterface)
 		info, err := ifaces.InterfaceByName(lanName)
 		if err != nil {
 			addIfaceIssue(ValidationError{
@@ -170,6 +170,14 @@ func ValidateWithOptions(cfg *Config, ifaces netutil.Provider, opts ValidateOpti
 				continue
 			}
 			seenIface[name] = true
+			if lanName != "" && name == lanName {
+				errs = append(errs, ValidationError{
+					Section: SectionGlobal,
+					Field:   "ingress_interfaces",
+					Message: fmt.Sprintf("유입 인터페이스(%s)는 LAN 인터페이스와 같을 수 없습니다", name),
+				})
+				continue
+			}
 			ingInfo, err := ifaces.InterfaceByName(name)
 			if err != nil {
 				addIfaceIssue(ValidationError{
@@ -187,11 +195,11 @@ func ValidateWithOptions(cfg *Config, ifaces netutil.Provider, opts ValidateOpti
 		}
 	}
 
-	if cfg.ProxyPort < 1 || cfg.ProxyPort > 65535 {
+	if cfg.ProxyPort < MinProxyPort || cfg.ProxyPort > MaxPort {
 		errs = append(errs, ValidationError{
 			Section: SectionGlobal,
 			Field:   "proxy_port",
-			Message: fmt.Sprintf("proxy_port는 1~65535 범위여야 합니다: %d", cfg.ProxyPort),
+			Message: fmt.Sprintf("proxy_port는 %d~%d 범위여야 합니다: %d", MinProxyPort, MaxPort, cfg.ProxyPort),
 		})
 	}
 	if cfg.WakeTimeout <= 0 {
@@ -481,6 +489,14 @@ func ValidateWithOptions(cfg *Config, ifaces netutil.Provider, opts ValidateOpti
 					Message:  fmt.Sprintf("존재하지 않는 클라이언트입니다: %s", cn),
 				})
 			}
+		}
+		if len(t.Profiles) > 0 && len(t.Allow) == 0 {
+			warns = append(warns, ValidationError{
+				Section:  SectionTarget,
+				ItemName: tName,
+				Field:    "allow",
+				Message:  "프로파일이 지정되어 있으나 허용 클라이언트(allow)가 비어 있어 가로채는 모든 연결이 거부됩니다",
+			})
 		}
 	}
 
