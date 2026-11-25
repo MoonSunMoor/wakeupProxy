@@ -160,9 +160,9 @@ targets:
 ### 주요 설정 항목
 
 - **전역 설정**
-  - `lan_interface`: 타깃 PC가 연결된 LAN 인터페이스 (업스트림 발신 IP 고정, 서브넷 브로드캐스트 계산 및 ARP 조회에 사용)
-  - `ingress_interfaces`: 연결을 가로챌 유입 인터페이스 목록 (예: `[wg0]`). 각 인터페이스의 IPv4 주소에 `IP_FREEBIND`로 `proxy_port`를 바인드합니다.
-  - `proxy_port`: `nftables` 리다이렉트를 수신할 로컬 포트 (생략 가능, 기본 `13389`)
+  - `lan_interface`: 타깃 PC가 연결된 LAN 인터페이스 (업스트림 발신 IP 고정, 서브넷 브로드캐스트 계산 및 ARP 조회에 사용. 다중 IPv4 서브넷이 있으면 각 타깃 IP가 속한 서브넷의 출발지 IP와 브로드캐스트 주소를 사용)
+  - `ingress_interfaces`: 연결을 가로챌 유입 인터페이스 목록 (`lan_interface`와 중복될 수 없음, 예: `[wg0]`). 각 인터페이스의 IPv4 주소에 `IP_FREEBIND`로 `proxy_port`를 바인드합니다.
+  - `proxy_port`: `nftables` 리다이렉트를 수신할 로컬 포트 (생략 가능, 기본 `13389`, 허용 범위 `1024~65535`)
   - `wake_timeout` / `wake_cooldown` / `poll_interval`: 깨우기 최대 대기 시간(기본 `120s`), 매직 패킷 재송신 주기(기본 `10s`), 포트 열림 확인 주기(기본 `2s`)
     - **`wake_timeout` 기준**: 개별 클라이언트 연결마다 따로 시작되는 시간이 아니라, 해당 `(타깃, 포트)`에 대해 **공유된 깨우기 작업(`singleflight` 첫 매직 패킷 송신 및 폴링 시작 시점)** 기준으로 측정됩니다.
 - **`clients`**: 접속을 허용할 클라이언트 이름과 IPv4 주소/CIDR
@@ -183,11 +183,11 @@ targets:
 
 데몬 시작, `wolproxy check`, 재적재(`reload`), TUI 저장 시 공통 검증기를 실행합니다.
 
-- 비어 있거나 중복된 `lan_interface` / `ingress_interfaces` (존재하지 않거나 IPv4가 없는 인터페이스는 `serve` 시작 시에만 오류로 처리되며, `wg-quick down` 등 운영 중 `check`·`reload`·TUI 저장에서는 경고만 표시하고 나머지 설정을 적용합니다)
+- 비어 있거나 중복된 `lan_interface` / `ingress_interfaces`, 또는 `lan_interface`와 동일한 인터페이스가 `ingress_interfaces`에 포함된 경우 (존재하지 않거나 IPv4가 없는 인터페이스는 `serve` 시작 시에만 오류로 처리되며, `wg-quick down` 등 운영 중 `check`·`reload`·TUI 저장에서는 경고만 표시하고 나머지 설정을 적용합니다)
 - `lan_interface` 서브넷 대역 밖의 타깃 `ip`, 서브넷 네트워크/브로드캐스트 주소, 또는 호스트 자신의 로컬 인터페이스 IP와 충돌하는 `ip` / `alias`
 - 중복된 타깃 이름·IP·별칭, 또는 LAN 인터페이스 서브넷과 겹치는 `alias`
-- 잘못된 IPv4/CIDR, 유효하지 않은 6바이트 MAC 주소, 포트 범위(`1~65535`) 이탈
-- 존재하지 않는 클라이언트·프로파일 참조, 한 타깃 내 동일 포트를 쓰는 복수 프로파일 지정
+- 잘못된 IPv4/CIDR, 유효하지 않은 6바이트 MAC 주소, `proxy_port` 범위(`1024~65535`) 또는 프로파일 포트 범위(`1~65535`) 이탈
+- 존재하지 않는 클라이언트·프로파일 참조, 한 타깃 내 동일 포트를 쓰는 복수 프로파일 지정 (프로파일이 지정된 타깃의 `allow` 목록이 비어 있으면 모든 가로채기 연결이 거부되므로 경고 표시)
 
 ---
 
@@ -218,9 +218,9 @@ targets:
 | `d` | 항목 삭제 (타깃이 참조 중인 클라이언트·프로파일은 삭제 차단 및 참조 타깃 안내) | 목록 |
 | `w` | 선택한 타깃에 즉시 매직 패킷 송신 (`깨우는 중` 표시) | 타깃 목록 |
 | `t` | 선택한 타깃의 프로파일 TCP 포트 열림 테스트 | 타깃 목록 |
-| `Ctrl+L` | LAN 서브넷(`/22` 이하) ARP 스캔으로 켜진 기기 IP·MAC·호스트명 검색 (`root` 전용) | 타깃 폼 |
+| `Ctrl+L` | LAN 서브넷(`/22` 이하) ARP 스캔으로 켜진 기기 IP·MAC·호스트명 검색 후 IP·MAC 채우기 (`root` 전용) | 타깃 폼 |
 | `Esc` | 폼 편집 취소(변경 버림) 또는 대화상자 닫기 | 폼 / 대화상자 |
-| `s` / `Ctrl+S` | 검증 → 변경 요약 확인 → 백업(`.bak`)·원자적 저장 → `systemctl reload/restart` 적용 | 전체 |
+| `s` / `Ctrl+S` | 검증 → 변경 요약 확인 → 백업(`.bak`)·원자적 저장 → `systemctl reload/restart` 적용 (폼 안에서는 `Ctrl+S`) | 전체 |
 | `?` | 도움말 열기/닫기 | 전체 |
 | `q` | 종료 (저장하지 않은 변경이 있으면 확인) | 전체 |
 
@@ -257,6 +257,7 @@ sudo systemctl edit wolproxy
 .
 ├── cmd/
 │   └── wolproxy/       # CLI 진입점 (TUI, serve, reload, wake, check)
+├── docs/               # 기능 명세, TUI 명세 및 향후 검토 문서
 ├── internal/
 │   ├── arp/            # Linux AF_PACKET raw ARP 스캔 및 Netlink 이웃 테이블 조회
 │   ├── config/         # YAML 파싱/직렬화, 주석 감지, 검증, 변경 요약(Diff), 디렉터리 fsync 원자적 저장

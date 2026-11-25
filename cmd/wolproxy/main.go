@@ -180,6 +180,18 @@ func runCheck(cfgPath string, stderr io.Writer) int {
 }
 
 func runWake(cfgPath string, args []string, stderr io.Writer) int {
+	return runWakeWithDeps(cfgPath, args, stderr, netutil.SystemProvider{}, wol.UDPSender{}, nil, arp.NewSystemChecker())
+}
+
+func runWakeWithDeps(
+	cfgPath string,
+	args []string,
+	stderr io.Writer,
+	ifaces netutil.Provider,
+	sender wol.Sender,
+	customDial wol.DialFunc,
+	arpChecker arp.Checker,
+) int {
 	var wait bool
 	var targetNames []string
 	for _, a := range args {
@@ -204,7 +216,9 @@ func runWake(cfgPath string, args []string, stderr io.Writer) int {
 		return 1
 	}
 
-	ifaces := netutil.SystemProvider{}
+	if ifaces == nil {
+		ifaces = netutil.SystemProvider{}
+	}
 	lanInfo, err := ifaces.InterfaceByName(cfg.LANInterface)
 	if err != nil {
 		fmt.Fprintf(stderr, "LAN 인터페이스(%s) 조회 실패: %v\n", cfg.LANInterface, err)
@@ -215,7 +229,7 @@ func runWake(cfgPath string, args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "LAN 인터페이스(%s)에 IPv4 서브넷이 없습니다.\n", cfg.LANInterface)
 		return 1
 	}
-	bcast, err := netutil.BroadcastAddr(lanPfx)
+	defaultBcast, err := netutil.BroadcastAddr(lanPfx)
 	if err != nil {
 		fmt.Fprintf(stderr, "브로드캐스트 주소 계산 실패: %v\n", err)
 		return 1
@@ -248,6 +262,15 @@ func runWake(cfgPath string, args []string, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "타깃 %s MAC 오류: %v\n", name, err)
 			return 1
 		}
+		targetBcast := defaultBcast
+		if tPfx, ok := lanInfo.ResolvePrefix(ipAddr); ok {
+			tBcast, bErr := netutil.BroadcastAddr(tPfx)
+			if bErr != nil {
+				fmt.Fprintf(stderr, "타깃 %s 브로드캐스트 주소 계산 실패: %v\n", name, bErr)
+				return 1
+			}
+			targetBcast = tBcast
+		}
 		var ports []int
 		for _, pn := range t.Profiles {
 			if pr, ok := cfg.Profiles[pn]; ok && pr.Port >= 1 && pr.Port <= 65535 {
@@ -255,27 +278,35 @@ func runWake(cfgPath string, args []string, stderr io.Writer) int {
 			}
 		}
 		wakeTargets = append(wakeTargets, wol.CLIWakeTarget{
-			Name:  t.Name,
-			IP:    ipAddr,
-			MAC:   macHW,
-			Ports: ports,
+			Name:          t.Name,
+			IP:            ipAddr,
+			MAC:           macHW,
+			BroadcastAddr: targetBcast,
+			Ports:         ports,
 		})
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	arpChecker := arp.NewSystemChecker()
+	if arpChecker == nil {
+		arpChecker = arp.NewSystemChecker()
+	}
 	arpProbe := func(pCtx context.Context, ip netip.Addr) (bool, error) {
 		return arpChecker.IsAwake(pCtx, lanInfo, ip)
 	}
 
+	dialFn := customDial
+	if dialFn == nil {
+		dialFn = wol.NewInterfaceDialer(lanInfo)
+	}
+
 	err = wol.WakeTargets(
 		ctx,
-		wol.UDPSender{},
-		wol.NewLANDialer(lanPfx.Addr()),
+		sender,
+		dialFn,
 		arpProbe,
-		bcast,
+		defaultBcast,
 		wakeTargets,
 		wait,
 		cfg.WakeTimeout.Std(),

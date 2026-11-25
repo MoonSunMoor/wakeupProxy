@@ -26,8 +26,8 @@ func (SystemChecker) LookupMAC(_ context.Context, _ netutil.InterfaceInfo, _ net
 }
 
 func (SystemChecker) ScanSubnet(_ context.Context, lanIface netutil.InterfaceInfo) ([]DiscoveredHost, error) {
-	if p, ok := lanIface.PrimaryPrefix(); ok && p.Bits() < MaxScanPrefixBits {
-		return nil, ErrSubnetTooLarge
+	if _, err := CollectScanTargets(lanIface); err != nil {
+		return nil, err
 	}
 	return nil, errors.New("LAN ARP 검색은 Linux root 환경에서만 지원됩니다")
 }

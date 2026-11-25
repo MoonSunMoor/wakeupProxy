@@ -163,6 +163,7 @@ type Model struct {
 	valWarnings    config.ValidationErrorList
 	pendingDiff    config.DiffResult
 	restartReasons []string
+	saveSyncWarn   string
 
 	deleteSection tabIndex
 	deleteName    string
@@ -219,6 +220,12 @@ func NewModel(deps Dependencies) (*Model, error) {
 		statusLine:   initStatus,
 	}
 	return m, nil
+}
+
+func (m *Model) consumeSaveSyncWarn() string {
+	w := m.saveSyncWarn
+	m.saveSyncWarn = ""
+	return w
 }
 
 func (m *Model) isDirty() bool {
@@ -293,7 +300,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				curKey := focusedFieldKey(m.form)
 				m.tDraft.mac = msg.mac
 				m.macAutoNote = "시스템 ARP 기록에서 자동 입력됨: " + msg.mac
-				m.rebuildTargetFormFocusing(curKey)
+				return m, m.rebuildTargetFormFocusing(curKey)
 			} else if msg.mac == "" {
 				m.macAutoNote = msg.reason
 			}
@@ -334,6 +341,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.logs != "" {
 				detail += "\n\n[journald 최근 로그]\n" + msg.logs
 			}
+			if warn := m.consumeSaveSyncWarn(); warn != "" {
+				detail += "\n\n⚠ 경고: " + warn
+			}
 			m.showNotice("서비스 적용 실패", detail, true, screenList)
 			return m, nil
 		}
@@ -343,7 +353,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			actionKor = "재시작(restart)"
 		}
 		m.statusLine = fmt.Sprintf("설정 저장 및 서비스 %s 완료", actionKor)
-		m.showNotice("저장 및 적용 완료", fmt.Sprintf("설정 파일을 저장하고 wolproxy 서비스를 %s했습니다.", actionKor), false, screenList)
+		body := fmt.Sprintf("설정 파일을 저장하고 wolproxy 서비스를 %s했습니다.", actionKor)
+		if warn := m.consumeSaveSyncWarn(); warn != "" {
+			body += "\n\n⚠ 경고: " + warn
+		}
+		m.showNotice("저장 및 적용 완료", body, false, screenList)
 		return m, nil
 
 	case tea.KeyMsg:

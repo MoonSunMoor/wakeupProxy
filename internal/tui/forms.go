@@ -78,8 +78,17 @@ func validateRequiredName(label string) func(string) error {
 func validatePortStr(s string) error {
 	s = strings.TrimSpace(s)
 	n, err := strconv.Atoi(s)
-	if err != nil || n < 1 || n > 65535 {
-		return errors.New("포트는 1~65535 사이의 숫자여야 합니다")
+	if err != nil || n < 1 || n > config.MaxPort {
+		return fmt.Errorf("포트는 1~%d 사이의 숫자여야 합니다", config.MaxPort)
+	}
+	return nil
+}
+
+func validateProxyPortStr(s string) error {
+	s = strings.TrimSpace(s)
+	n, err := strconv.Atoi(s)
+	if err != nil || n < config.MinProxyPort || n > config.MaxPort {
+		return fmt.Errorf("proxy_port는 %d~%d 사이의 숫자여야 합니다", config.MinProxyPort, config.MaxPort)
 	}
 	return nil
 }
@@ -193,6 +202,12 @@ func (m *Model) buildTargetForm() *huh.Form {
 				Filterable(false).
 				Value(&m.tDraft.profiles),
 		)
+	} else {
+		fields = append(fields,
+			huh.NewNote().
+				Title("프로파일").
+				Description("등록된 프로파일이 없어 선택할 수 없습니다. '3. 프로파일' 탭에서 먼저 추가해 주세요."),
+		)
 	}
 	if len(clientOpts) > 0 {
 		fields = append(fields,
@@ -202,6 +217,12 @@ func (m *Model) buildTargetForm() *huh.Form {
 				Options(clientOpts...).
 				Filterable(false).
 				Value(&m.tDraft.allow),
+		)
+	} else {
+		fields = append(fields,
+			huh.NewNote().
+				Title("허용 클라이언트").
+				Description("등록된 클라이언트가 없어 허용 클라이언트를 선택할 수 없습니다. '2. 클라이언트' 탭에서 먼저 추가해 주세요."),
 		)
 	}
 
@@ -486,13 +507,19 @@ func (m *Model) buildGlobalForm() *huh.Form {
 				if len(sel) == 0 {
 					return errors.New("유입 인터페이스를 하나 이상 선택해 주세요")
 				}
+				lanName := strings.TrimSpace(m.gDraft.lanInterface)
+				for _, s := range sel {
+					if lanName != "" && strings.TrimSpace(s) == lanName {
+						return fmt.Errorf("유입 인터페이스(%s)는 LAN 인터페이스와 같을 수 없습니다", lanName)
+					}
+				}
 				return nil
 			}),
 		huh.NewInput().
 			Key("proxy_port").
-			Title("프록시 리슨 포트 (proxy_port)").
+			Title("프록시 리슨 포트 (proxy_port, 1024~65535)").
 			Value(&m.gDraft.proxyPort).
-			Validate(validatePortStr),
+			Validate(validateProxyPortStr),
 		huh.NewInput().
 			Key("wake_timeout").
 			Title("깨우기 대기 제한 시간 (wake_timeout)").

@@ -17,14 +17,15 @@ import (
 )
 
 const (
-	MaxScanPrefixBits = 22 // /22보다 큰 서브넷(prefix < 22)은 스캔하지 않음
+	MaxScanPrefixBits = 22   // /22보다 큰 서브넷(prefix < 22)은 스캔하지 않음
+	MaxScanHosts      = 1022 // /22 기준 최대 스캔 호스트 수 (2^(32-22) - 2)
 
-	etherTypeARP = 0x0806
-	etherTypeIP4 = 0x0800
-	arpHW Type   = 1 // Ethernet
-	arpOpRequest = 1
-	arpOpReply   = 2
-	arpFrameLen  = 42 // 14-byte Ethernet header + 28-byte IPv4 ARP payload
+	etherTypeARP      = 0x0806
+	etherTypeIP4      = 0x0800
+	arpHW        Type = 1 // Ethernet
+	arpOpRequest      = 1
+	arpOpReply        = 2
+	arpFrameLen       = 42 // 14-byte Ethernet header + 28-byte IPv4 ARP payload
 )
 
 type Type uint16
@@ -46,6 +47,50 @@ type Checker interface {
 	IsAwake(ctx context.Context, lanIface netutil.InterfaceInfo, ip netip.Addr) (bool, error)
 	LookupMAC(ctx context.Context, lanIface netutil.InterfaceInfo, ip netip.Addr) (mac string, reason string)
 	ScanSubnet(ctx context.Context, lanIface netutil.InterfaceInfo) ([]DiscoveredHost, error)
+}
+
+// SelectSourceIP chooses the local IPv4 address on lanIface whose subnet contains targetIP
+// (longest prefix match), falling back to lanIface.PrimaryPrefix() when none matches.
+func SelectSourceIP(lanIface netutil.InterfaceInfo, targetIP netip.Addr) (netip.Addr, bool) {
+	if pfx, ok := lanIface.ResolvePrefix(targetIP); ok {
+		return pfx.Addr(), true
+	}
+	return netip.Addr{}, false
+}
+
+// CollectScanTargets validates all IPv4 prefixes on lanIface and builds the deduplicated
+// host IPv4 address list for LAN ARP scanning. It returns ErrSubnetTooLarge if any prefix
+// is larger than /22 (Bits < 22) or if deduplicated total hosts exceed MaxScanHosts (1,022).
+func CollectScanTargets(lanIface netutil.InterfaceInfo) ([]netip.Addr, error) {
+	var validPrefixes []netip.Prefix
+	for _, p := range lanIface.Prefixes {
+		if !p.IsValid() || !p.Addr().Is4() {
+			continue
+		}
+		if p.Bits() < MaxScanPrefixBits {
+			return nil, ErrSubnetTooLarge
+		}
+		validPrefixes = append(validPrefixes, p)
+	}
+	if len(validPrefixes) == 0 {
+		return nil, fmt.Errorf("LAN 인터페이스(%s)에 IPv4 서브넷이 없습니다", lanIface.Name)
+	}
+
+	seen := make(map[netip.Addr]bool)
+	var targets []netip.Addr
+	for _, p := range validPrefixes {
+		for _, ip := range netutil.SubnetHosts(p) {
+			if seen[ip] {
+				continue
+			}
+			seen[ip] = true
+			if len(targets) >= MaxScanHosts {
+				return nil, ErrSubnetTooLarge
+			}
+			targets = append(targets, ip)
+		}
+	}
+	return targets, nil
 }
 
 // BuildEthernetARPRequest constructs a 42-byte Ethernet II + IPv4 ARP Request frame.

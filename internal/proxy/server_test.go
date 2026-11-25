@@ -1842,3 +1842,224 @@ func TestConcurrentReloadFromFileAppliesLatestDiskSnapshot(t *testing.T) {
 		t.Fatalf("post-shutdown ReloadFromFile touched NFT: %d -> %d", applyCountBeforeShutdown, applyCountAfter)
 	}
 }
+
+type recordingWoLSender struct {
+	mu    sync.Mutex
+	bcast map[string]netip.Addr
+}
+
+func (r *recordingWoLSender) SendMagicPacket(_ context.Context, broadcastAddr netip.Addr, mac net.HardwareAddr) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.bcast == nil {
+		r.bcast = make(map[string]netip.Addr)
+	}
+	r.bcast[mac.String()] = broadcastAddr
+	return nil
+}
+
+func TestMultiSubnetLANBroadcastAndUpstreamSourceIP(t *testing.T) {
+	// Part 1: Verify per-target broadcast address selection on multi-subnet lan_interface
+	probeLn, _ := net.Listen("tcp4", "127.0.0.1:0")
+	proxyPort := probeLn.Addr().(*net.TCPAddr).Port
+	_ = probeLn.Close()
+
+	multiLANIfaces := netutil.StaticProvider{
+		Items: []netutil.InterfaceInfo{
+			{
+				Name:  "eth0",
+				Index: 2,
+				Prefixes: []netip.Prefix{
+					netip.MustParsePrefix("192.168.0.10/24"),
+					netip.MustParsePrefix("192.168.10.10/24"),
+				},
+				Up: true,
+			},
+			{
+				Name:     "wg0",
+				Index:    3,
+				Prefixes: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")},
+				Up:       true,
+			},
+		},
+	}
+
+	cfg := &config.Config{
+		LANInterface:      "eth0",
+		IngressInterfaces: []string{"wg0"},
+		ProxyPort:         proxyPort,
+		WakeTimeout:       config.Duration(180 * time.Millisecond),
+		WakeCooldown:      config.Duration(time.Second),
+		PollInterval:      config.Duration(40 * time.Millisecond),
+		Clients:           map[string]config.Client{"laptop": {CIDR: "127.0.0.1/32"}},
+		Profiles:          map[string]config.Profile{"ssh": {Port: 22, Wake: config.WakeAuto}},
+		Targets: []config.Target{
+			{
+				Name:     "pc-sub1",
+				IP:       "192.168.0.21",
+				MAC:      "aa:bb:cc:dd:ee:01",
+				Profiles: []string{"ssh"},
+				Allow:    []string{"laptop"},
+			},
+			{
+				Name:     "pc-sub2",
+				IP:       "192.168.10.22",
+				MAC:      "aa:bb:cc:dd:ee:02",
+				Profiles: []string{"ssh"},
+				Allow:    []string{"laptop"},
+			},
+		},
+	}
+
+	recWoL := &recordingWoLSender{}
+	var origDst atomic.Value
+	srv := NewServer(Options{
+		Interfaces: multiLANIfaces,
+		NFT:        &fakeNFT{},
+		WoLSender:  recWoL,
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OrigDst: func(_ net.Conn) (netip.AddrPort, error) {
+			return origDst.Load().(netip.AddrPort), nil
+		},
+		Dial: func(_ context.Context, _ string) (net.Conn, error) {
+			return nil, syscall.EHOSTUNREACH
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	for _, dst := range []string{"192.168.0.21:22", "192.168.10.22:22"} {
+		origDst.Store(netip.MustParseAddrPort(dst))
+		c, err := net.Dial("tcp4", srv.ListenerAddrs()[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		_, _ = c.Read(make([]byte, 4))
+		_ = c.Close()
+	}
+
+	recWoL.mu.Lock()
+	bcast1 := recWoL.bcast["aa:bb:cc:dd:ee:01"]
+	bcast2 := recWoL.bcast["aa:bb:cc:dd:ee:02"]
+	recWoL.mu.Unlock()
+
+	if bcast1 != netip.MustParseAddr("192.168.0.255") {
+		t.Fatalf("expected pc-sub1 broadcast 192.168.0.255, got %v", bcast1)
+	}
+	if bcast2 != netip.MustParseAddr("192.168.10.255") {
+		t.Fatalf("expected pc-sub2 broadcast 192.168.10.255, got %v", bcast2)
+	}
+
+	// Part 2: Verify dialUpstream binds matching subnet's local IPv4 address using 127.0.1.0/24 and 127.0.2.0/24
+	lnSub2, err := net.Listen("tcp4", "127.0.2.20:0")
+	if err != nil {
+		t.Skipf("loopback secondary subnet 127.0.2.20 unavailable on this OS: %v", err)
+	}
+	defer lnSub2.Close()
+	observedSrcCh := make(chan string, 1)
+	go func() {
+		c, err := lnSub2.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		host, _, _ := net.SplitHostPort(c.RemoteAddr().String())
+		observedSrcCh <- host
+	}()
+
+	srvRealDial := NewServer(Options{
+		Interfaces: netutil.StaticProvider{
+			Items: []netutil.InterfaceInfo{
+				{
+					Name:  "lan0",
+					Index: 10,
+					Prefixes: []netip.Prefix{
+						netip.MustParsePrefix("127.0.1.10/24"),
+						netip.MustParsePrefix("127.0.2.10/24"),
+					},
+					Up: true,
+				},
+			},
+		},
+		NFT:    &fakeNFT{},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	srvRealDial.connsMu.Lock()
+	srvRealDial.curState = &compiledState{
+		lanInterface: "lan0",
+		lanSourceIP:  netip.MustParseAddr("127.0.1.10"),
+		lanInfo: netutil.InterfaceInfo{
+			Name: "lan0",
+			Prefixes: []netip.Prefix{
+				netip.MustParsePrefix("127.0.1.10/24"),
+				netip.MustParsePrefix("127.0.2.10/24"),
+			},
+		},
+	}
+	srvRealDial.connsMu.Unlock()
+
+	dConn, err := srvRealDial.dialUpstream(context.Background(), lnSub2.Addr().String())
+	if err != nil {
+		t.Fatalf("dialUpstream to second loopback subnet failed: %v", err)
+	}
+	_ = dConn.Close()
+	if gotSrc := <-observedSrcCh; gotSrc != "127.0.2.10" {
+		t.Fatalf("expected dialUpstream to bind second subnet source 127.0.2.10, got %s", gotSrc)
+	}
+}
+
+func TestIdleStateRingBufferLongWindowAndZeroAlloc(t *testing.T) {
+	t0 := time.Date(2026, 11, 25, 0, 0, 0, 0, time.UTC)
+	timeout := 24 * time.Hour
+	st := newIdleState(t0, timeout, 100)
+
+	// Simulate 4,000 ticks before timeout with burst at +6h -> never fires before 24h
+	cur := t0
+	for i := 0; i < 4000; i++ {
+		cur = cur.Add(15 * time.Second)
+		if cur.Equal(t0.Add(6 * time.Hour)) {
+			st.counter.Store(5000)
+		}
+		if st.check(cur) {
+			t.Fatalf("idleState fired before timeout at +%v", cur.Sub(t0))
+		}
+	}
+
+	// Advance to 29h59m (23h59m since the 5000-byte burst at +6h) -> still active in 24h window!
+	for cur.Before(t0.Add(29*time.Hour + 59*time.Minute)) {
+		cur = cur.Add(5 * time.Minute)
+		if st.check(cur) {
+			t.Fatalf("idleState fired prematurely at +%v while +6h burst was still inside 24h window", cur.Sub(t0))
+		}
+	}
+
+	// Advance past 30h + step (more than 24h since +6h burst, 0 bytes since) -> must fire!
+	fired := false
+	for i := 0; i < 10; i++ {
+		cur = cur.Add(5 * time.Minute)
+		if st.check(cur) {
+			fired = true
+			break
+		}
+	}
+	if !fired {
+		t.Fatal("expected idleState to fire once 24h elapsed after +6h burst")
+	}
+
+	// Verify strictly 0 heap allocations per check() tick on long window
+	allocTime := cur
+	allocs := testing.AllocsPerRun(1000, func() {
+		allocTime = allocTime.Add(250 * time.Millisecond)
+		st.counter.Add(10)
+		_ = st.check(allocTime)
+	})
+	if allocs != 0 {
+		t.Fatalf("expected 0 allocs/op in idleState.check ring buffer, got %v", allocs)
+	}
+}

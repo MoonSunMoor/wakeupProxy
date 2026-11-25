@@ -54,6 +54,7 @@ type routeEntry struct {
 	usedAlias     bool
 	origDstIP     netip.Addr
 	mac           net.HardwareAddr
+	sourceIP      netip.Addr
 	broadcastAddr netip.Addr
 	profileName   string
 	port          int
@@ -75,6 +76,7 @@ func (r *routeEntry) matchClient(ip netip.Addr) (string, bool) {
 type compiledState struct {
 	cfg               *config.Config
 	lanInterface      string
+	lanInfo           netutil.InterfaceInfo
 	lanSourceIP       netip.Addr
 	lanBroadcast      netip.Addr
 	ingressInterfaces []string
@@ -118,13 +120,21 @@ func buildCompiledState(
 	ingNames := trimStrings(cfg.IngressInterfaces)
 	proxyPort := cfg.ProxyPort
 
+	var lanInfo netutil.InterfaceInfo
 	var lanSourceIP netip.Addr
 	var bcast netip.Addr
-	if lanInfo, err := ifaces.InterfaceByName(lanName); err == nil {
-		if lanPrefix, ok := lanInfo.PrimaryPrefix(); ok {
+	if info, err := ifaces.InterfaceByName(lanName); err == nil {
+		if lanPrefix, ok := info.PrimaryPrefix(); ok {
 			bAddr, bErr := netutil.BroadcastAddr(lanPrefix)
 			if bErr != nil {
 				return nil, bErr
+			}
+			lanInfo = netutil.InterfaceInfo{
+				Name:     lanName,
+				Index:    info.Index,
+				Prefixes: append([]netip.Prefix(nil), info.Prefixes...),
+				Loopback: info.Loopback,
+				Up:       info.Up,
 			}
 			lanSourceIP = lanPrefix.Addr()
 			bcast = bAddr
@@ -132,6 +142,13 @@ func buildCompiledState(
 	}
 	if !bcast.IsValid() {
 		if prev != nil && strings.TrimSpace(prev.lanInterface) == lanName && prev.lanBroadcast.IsValid() {
+			lanInfo = netutil.InterfaceInfo{
+				Name:     lanName,
+				Index:    prev.lanInfo.Index,
+				Prefixes: append([]netip.Prefix(nil), prev.lanInfo.Prefixes...),
+				Loopback: prev.lanInfo.Loopback,
+				Up:       prev.lanInfo.Up,
+			}
 			lanSourceIP = prev.lanSourceIP
 			bcast = prev.lanBroadcast
 		} else {
@@ -167,6 +184,17 @@ func buildCompiledState(
 			}
 		}
 
+		routeSrcIP := lanSourceIP
+		routeBcast := bcast
+		if tPfx, ok := lanInfo.ResolvePrefix(tIP); ok {
+			tBcast, bErr := netutil.BroadcastAddr(tPfx)
+			if bErr != nil {
+				return nil, bErr
+			}
+			routeSrcIP = tPfx.Addr()
+			routeBcast = tBcast
+		}
+
 		allowed := make([]compiledClient, 0, len(t.Allow))
 		for _, cn := range t.Allow {
 			if cc, ok := compiledClients[cn]; ok {
@@ -184,7 +212,8 @@ func buildCompiledState(
 				usedAlias:     false,
 				origDstIP:     tIP,
 				mac:           macHW,
-				broadcastAddr: bcast,
+				sourceIP:      routeSrcIP,
+				broadcastAddr: routeBcast,
 				profileName:   pn,
 				port:          pr.Port,
 				wake:          pr.Wake,
@@ -210,6 +239,7 @@ func buildCompiledState(
 	return &compiledState{
 		cfg:               normalizedCfg,
 		lanInterface:      lanName,
+		lanInfo:           lanInfo,
 		lanSourceIP:       lanSourceIP,
 		lanBroadcast:      bcast,
 		ingressInterfaces: append([]string(nil), ingNames...),
@@ -396,12 +426,17 @@ func (s *Server) dialUpstream(ctx context.Context, addr string) (net.Conn, error
 		return s.customDial(ctx, addr)
 	}
 	s.connsMu.Lock()
-	var lanIP netip.Addr
+	var lanInfo netutil.InterfaceInfo
+	var fallbackIP netip.Addr
 	if s.curState != nil {
-		lanIP = s.curState.lanSourceIP
+		lanInfo = s.curState.lanInfo
+		fallbackIP = s.curState.lanSourceIP
 	}
 	s.connsMu.Unlock()
-	return wol.NewLANDialer(lanIP)(ctx, addr)
+	if len(lanInfo.Prefixes) > 0 {
+		return wol.NewInterfaceDialer(lanInfo)(ctx, addr)
+	}
+	return wol.NewLANDialer(fallbackIP)(ctx, addr)
 }
 
 // prepareIngressListeners binds only newly added ingress listener addresses without

@@ -40,6 +40,37 @@ func (info InterfaceInfo) PrimaryPrefix() (netip.Prefix, bool) {
 	return netip.Prefix{}, false
 }
 
+// MatchingPrefix returns the IPv4 prefix on this interface whose subnet contains addr.
+// When multiple prefixes match, the longest prefix (most specific subnet) is chosen.
+func (info InterfaceInfo) MatchingPrefix(addr netip.Addr) (netip.Prefix, bool) {
+	if !addr.Is4() {
+		return netip.Prefix{}, false
+	}
+	var best netip.Prefix
+	found := false
+	for _, p := range info.Prefixes {
+		if !p.Addr().Is4() {
+			continue
+		}
+		if p.Masked().Contains(addr) {
+			if !found || p.Bits() > best.Bits() {
+				best = p
+				found = true
+			}
+		}
+	}
+	return best, found
+}
+
+// ResolvePrefix returns MatchingPrefix(addr) when addr belongs to one of the interface's
+// IPv4 subnets, or falls back to PrimaryPrefix() otherwise.
+func (info InterfaceInfo) ResolvePrefix(addr netip.Addr) (netip.Prefix, bool) {
+	if p, ok := info.MatchingPrefix(addr); ok {
+		return p, true
+	}
+	return info.PrimaryPrefix()
+}
+
 // ContainsIPv4 reports whether any IPv4 subnet on this interface contains addr.
 func (info InterfaceInfo) ContainsIPv4(addr netip.Addr) bool {
 	if !addr.Is4() {

@@ -68,3 +68,41 @@ func TestParseIPv4OrCIDRAndNormalizeMAC(t *testing.T) {
 		t.Fatal("expected 8-byte MAC to be rejected")
 	}
 }
+
+func TestMatchingAndResolvePrefixMultiSubnet(t *testing.T) {
+	info := InterfaceInfo{
+		Name:  "eth0",
+		Index: 2,
+		Prefixes: []netip.Prefix{
+			netip.MustParsePrefix("192.168.0.10/24"),
+			netip.MustParsePrefix("192.168.10.10/24"),
+			netip.MustParsePrefix("10.20.0.5/16"),
+			netip.MustParsePrefix("10.20.30.7/24"),
+		},
+	}
+
+	// Disjoint secondary subnet selects second prefix
+	got, ok := info.MatchingPrefix(netip.MustParseAddr("192.168.10.55"))
+	if !ok || got.String() != "192.168.10.10/24" {
+		t.Fatalf("expected 192.168.10.10/24, got %v (ok=%v)", got, ok)
+	}
+
+	// Overlapping prefixes select longest prefix (/24 over /16)
+	gotLongest, ok := info.MatchingPrefix(netip.MustParseAddr("10.20.30.99"))
+	if !ok || gotLongest.String() != "10.20.30.7/24" {
+		t.Fatalf("expected longest prefix 10.20.30.7/24, got %v (ok=%v)", gotLongest, ok)
+	}
+	gotBroader, ok := info.MatchingPrefix(netip.MustParseAddr("10.20.99.99"))
+	if !ok || gotBroader.String() != "10.20.0.5/16" {
+		t.Fatalf("expected broader prefix 10.20.0.5/16, got %v (ok=%v)", gotBroader, ok)
+	}
+
+	// Unmatched IP returns false from MatchingPrefix and falls back to PrimaryPrefix in ResolvePrefix
+	if _, ok := info.MatchingPrefix(netip.MustParseAddr("172.16.0.5")); ok {
+		t.Fatal("expected MatchingPrefix false for unrelated subnet")
+	}
+	fallback, ok := info.ResolvePrefix(netip.MustParseAddr("172.16.0.5"))
+	if !ok || fallback.String() != "192.168.0.10/24" {
+		t.Fatalf("expected ResolvePrefix fallback to primary 192.168.0.10/24, got %v (ok=%v)", fallback, ok)
+	}
+}

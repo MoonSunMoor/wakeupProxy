@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -310,5 +311,80 @@ targets: []
 	nonStrictRep := ValidateWithOptions(cfg, onlyLAN, ValidateOptions{StrictInterfaces: false})
 	if len(nonStrictRep.Errors) != 0 || len(nonStrictRep.Warnings) != 1 || nonStrictRep.Warnings[0].Field != "ingress_interfaces" {
 		t.Fatalf("expected non-strict validation to emit 0 errors and 1 warning for missing wg0, got: %+v", nonStrictRep)
+	}
+}
+
+func TestValidateProxyPortRangeLANIngressOverlapAndBlackholeTargetWarning(t *testing.T) {
+	ifaces := testIfaces()
+
+	// 1. proxy_port < 1024 rejected; 1024 and 65535 accepted; profile port 22 (< 1024) still accepted
+	for _, badPort := range []int{1, 80, 1023, 65536} {
+		cfg, _, _ := ParseBytes([]byte(specExampleYAML))
+		cfg.ProxyPort = badPort
+		errs := Validate(cfg, ifaces)
+		if len(errs) != 1 || errs[0].Section != SectionGlobal || errs[0].Field != "proxy_port" {
+			t.Fatalf("expected proxy_port=%d to fail validation on proxy_port, got: %v", badPort, errs)
+		}
+	}
+	for _, okPort := range []int{1024, 65535} {
+		cfg, _, _ := ParseBytes([]byte(specExampleYAML))
+		cfg.ProxyPort = okPort
+		if errs := Validate(cfg, ifaces); len(errs) != 0 {
+			t.Fatalf("expected proxy_port=%d (with profile port 22) to pass validation, got: %v", okPort, errs)
+		}
+	}
+
+	// 2. lan_interface included in ingress_interfaces rejected
+	cfgOverlap, _, _ := ParseBytes([]byte(specExampleYAML))
+	cfgOverlap.IngressInterfaces = []string{"wg0", "eth0"}
+	errs := Validate(cfgOverlap, ifaces)
+	if len(errs) != 1 || errs[0].Section != SectionGlobal || errs[0].Field != "ingress_interfaces" {
+		t.Fatalf("expected lan_interface in ingress_interfaces to fail validation, got: %v", errs)
+	}
+
+	// 3. Target with profiles != empty and allow == empty emits Warning (not Error);
+	//    target with profiles == empty and allow == empty emits neither Error nor Warning.
+	cfgWarn, _, _ := ParseBytes([]byte(specExampleYAML))
+	cfgWarn.Targets[0].Allow = []string{}
+	cfgWarn.Targets[1].Profiles = []string{}
+	cfgWarn.Targets[1].Allow = []string{}
+	rep := ValidateWithOptions(cfgWarn, ifaces, ValidateOptions{StrictInterfaces: true})
+	if len(rep.Errors) != 0 {
+		t.Fatalf("expected empty allow not to be a blocking error, got: %v", rep.Errors)
+	}
+	if len(rep.Warnings) != 1 || rep.Warnings[0].Section != SectionTarget || rep.Warnings[0].ItemName != "pc1" || rep.Warnings[0].Field != "allow" {
+		t.Fatalf("expected single warning on pc1/allow, got: %v", rep.Warnings)
+	}
+}
+
+func TestSaveAtomicDirSyncErrorClassification(t *testing.T) {
+	origSync := syncDirFn
+	t.Cleanup(func() { syncDirFn = origSync })
+
+	cfg, _, _ := ParseBytes([]byte(specExampleYAML))
+
+	// 1. Unsupported filesystem errors (EINVAL, ENOTSUP, EOPNOTSUPP, EBADF) are ignored cleanly
+	for _, ignorable := range []error{syscall.EINVAL, syscall.ENOTSUP, syscall.EOPNOTSUPP, syscall.EBADF} {
+		syncDirFn = func(string) error { return ignorable }
+		p := filepath.Join(t.TempDir(), "config.yaml")
+		_, warn, err := SaveAtomicCheckedWithWarning(p, cfg, nil)
+		if err != nil || warn != nil {
+			t.Fatalf("expected %v from syncDir to be ignored without error or warning, got warn=%v err=%v", ignorable, warn, err)
+		}
+	}
+
+	// 2. Real I/O error after os.Rename keeps saved file intact and returns warning without failing save
+	syncDirFn = func(string) error { return syscall.EIO }
+	p := filepath.Join(t.TempDir(), "config.yaml")
+	_, warn, err := SaveAtomicCheckedWithWarning(p, cfg, nil)
+	if err != nil {
+		t.Fatalf("expected post-rename syncDir EIO not to fail save, got err=%v", err)
+	}
+	if warn == nil {
+		t.Fatal("expected post-rename syncDir EIO to return non-nil warning")
+	}
+	loaded, _, loadErr := Load(p)
+	if loadErr != nil || loaded.ProxyPort != cfg.ProxyPort {
+		t.Fatalf("expected saved file to be readable after post-rename syncDir warning, got %+v err=%v", loaded, loadErr)
 	}
 }

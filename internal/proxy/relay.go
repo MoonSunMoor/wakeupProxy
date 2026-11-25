@@ -42,21 +42,65 @@ type byteSample struct {
 	total int64
 }
 
-// idleState tracks rolling-window bidirectional byte throughput when idle_timeout > 0.
+const (
+	idleRingCap     = 128
+	idleTargetSlots = 96
+)
+
+// idleState tracks rolling-window bidirectional byte throughput when idle_timeout > 0
+// using a fixed-size bucketed ring buffer (O(1) time and zero heap allocations per tick).
 type idleState struct {
-	timeout   time.Duration
-	maxBytes  int64
-	startedAt time.Time
-	counter   atomic.Int64
-	samples   []byteSample
+	timeout    time.Duration
+	maxBytes   int64
+	startedAt  time.Time
+	step       time.Duration
+	counter    atomic.Int64
+	buf        [idleRingCap]byteSample
+	head       int
+	count      int
+	lastBucket int64
 }
 
 func newIdleState(now time.Time, timeout time.Duration, maxBytes int64) *idleState {
-	return &idleState{
-		timeout:   timeout,
-		maxBytes:  maxBytes,
-		startedAt: now,
-		samples:   []byteSample{{at: now, total: 0}},
+	step := max(timeout/idleTargetSlots, time.Millisecond)
+	st := &idleState{
+		timeout:    timeout,
+		maxBytes:   maxBytes,
+		startedAt:  now,
+		step:       step,
+		count:      1,
+		lastBucket: -1,
+	}
+	st.buf[0] = byteSample{at: now, total: 0}
+	return st
+}
+
+func (s *idleState) sampleAt(offset int) *byteSample {
+	return &s.buf[(s.head+offset)%idleRingCap]
+}
+
+func (s *idleState) recordSample(now time.Time, total int64) {
+	elapsed := now.Sub(s.startedAt)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	b := int64(elapsed / s.step)
+	if s.count >= 2 && b == s.lastBucket {
+		tail := s.sampleAt(s.count - 1)
+		if !now.Before(tail.at) {
+			tail.at = now
+			tail.total = total
+		}
+		return
+	}
+	if s.count == idleRingCap {
+		s.head = (s.head + 1) % idleRingCap
+		s.count--
+	}
+	*s.sampleAt(s.count) = byteSample{at: now, total: total}
+	s.count++
+	if b > s.lastBucket {
+		s.lastBucket = b
 	}
 }
 
@@ -65,29 +109,20 @@ func newIdleState(now time.Time, timeout time.Duration, maxBytes int64) *idleSta
 // are <= s.maxBytes.
 func (s *idleState) check(now time.Time) bool {
 	total := s.counter.Load()
-	cutoff := now.Add(-s.timeout)
-
 	if now.Sub(s.startedAt) < s.timeout {
-		s.samples = append(s.samples, byteSample{at: now, total: total})
+		s.recordSample(now, total)
 		return false
 	}
 
-	// Find the newest sample at or before cutoff (baseline at window start).
-	baseline := s.samples[0].total
-	pruneIdx := 0
-	for i, smp := range s.samples {
-		if !smp.at.After(cutoff) {
-			baseline = smp.total
-			pruneIdx = i
-		} else {
-			break
-		}
+	cutoff := now.Add(-s.timeout)
+	// Advance head while a newer sample is also at or before cutoff, so sampleAt(0)
+	// remains the newest recorded sample with at <= cutoff.
+	for s.count >= 2 && !s.sampleAt(1).at.After(cutoff) {
+		s.head = (s.head + 1) % idleRingCap
+		s.count--
 	}
-	if pruneIdx > 0 {
-		// Keep pruneIdx as anchor for subsequent ticks until superseded.
-		s.samples = append([]byteSample(nil), s.samples[pruneIdx:]...)
-	}
-	s.samples = append(s.samples, byteSample{at: now, total: total})
+	baseline := s.sampleAt(0).total
+	s.recordSample(now, total)
 
 	transferredInWindow := total - baseline
 	return transferredInWindow <= s.maxBytes

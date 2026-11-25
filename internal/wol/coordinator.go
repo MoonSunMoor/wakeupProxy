@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/MoonSunMoor/wakeupProxy/internal/netutil"
 )
 
 var ErrWakeTimeout = errors.New("타깃 깨우기 시간 초과")
@@ -40,6 +42,31 @@ func NewLANDialer(localIP netip.Addr) DialFunc {
 			KeepAlive: 30 * time.Second,
 		}
 		return d.DialContext(ctx, "tcp4", addr)
+	}
+}
+
+// NewInterfaceDialer returns a DialFunc that binds each outbound TCP connection to
+// the local IPv4 address of the subnet on lanInfo matching the destination IP
+// (falling back to lanInfo.PrimaryPrefix() when no subnet matches).
+func NewInterfaceDialer(lanInfo netutil.InterfaceInfo) DialFunc {
+	if len(lanInfo.Prefixes) == 0 {
+		return DefaultDialFunc
+	}
+	return func(ctx context.Context, addr string) (net.Conn, error) {
+		var localIP netip.Addr
+		if host, _, err := net.SplitHostPort(addr); err == nil {
+			if dstIP, pErr := netip.ParseAddr(host); pErr == nil {
+				if pfx, ok := lanInfo.ResolvePrefix(dstIP); ok {
+					localIP = pfx.Addr()
+				}
+			}
+		}
+		if !localIP.IsValid() {
+			if pfx, ok := lanInfo.PrimaryPrefix(); ok {
+				localIP = pfx.Addr()
+			}
+		}
+		return NewLANDialer(localIP)(ctx, addr)
 	}
 }
 
@@ -367,14 +394,22 @@ func (c *Coordinator) runPortPoll(ctx context.Context, callKey string, call *por
 
 // CLIWakeTarget describes a target for `wolproxy wake`.
 type CLIWakeTarget struct {
-	Name  string
-	IP    netip.Addr
-	MAC   net.HardwareAddr
-	Ports []int // empty when target has no profiles (falls back to ARP awake check)
+	Name          string
+	IP            netip.Addr
+	MAC           net.HardwareAddr
+	BroadcastAddr netip.Addr // optional per-target broadcast; falls back to WakeTargets bcast when invalid
+	Ports         []int      // empty when target has no profiles (falls back to ARP awake check)
 }
 
 // AwakeProbeFunc reports whether a profile-less target IP has responded via ARP.
 type AwakeProbeFunc func(ctx context.Context, ip netip.Addr) (bool, error)
+
+func targetBroadcast(t CLIWakeTarget, fallback netip.Addr) netip.Addr {
+	if t.BroadcastAddr.IsValid() {
+		return t.BroadcastAddr
+	}
+	return fallback
+}
 
 // WakeTargets sends magic packets to targets, and when wait is true, polls until
 // every target wakes up (via TCP profile port if present, otherwise ARP) or timeout expires.
@@ -399,7 +434,7 @@ func WakeTargets(
 	}
 
 	for _, t := range targets {
-		if err := sender.SendMagicPacket(ctx, bcast, t.MAC); err != nil {
+		if err := sender.SendMagicPacket(ctx, targetBroadcast(t, bcast), t.MAC); err != nil {
 			return fmt.Errorf("타깃 %s 매직 패킷 송신 실패: %w", t.Name, err)
 		}
 	}
@@ -417,7 +452,7 @@ func WakeTargets(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errCh <- waitSingleTargetCLI(waitCtx, sender, dial, arpProbe, bcast, t, wakeCooldown, pollInterval)
+			errCh <- waitSingleTargetCLI(waitCtx, sender, dial, arpProbe, targetBroadcast(t, bcast), t, wakeCooldown, pollInterval)
 		}()
 	}
 	wg.Wait()
