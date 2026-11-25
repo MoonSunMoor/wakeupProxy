@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -114,13 +115,12 @@ func (m *Model) startLANScan() (tea.Model, tea.Cmd) {
 		m.showNotice("LAN 검색 불가", fmt.Sprintf("LAN 인터페이스(%s)를 찾을 수 없습니다: %v", m.cfg.LANInterface, err), true, screenTargetForm)
 		return m, nil
 	}
-	pfx, ok := lanInfo.PrimaryPrefix()
-	if !ok {
-		m.showNotice("LAN 검색 불가", fmt.Sprintf("LAN 인터페이스(%s)에 IPv4 서브넷이 없습니다.", m.cfg.LANInterface), true, screenTargetForm)
-		return m, nil
-	}
-	if pfx.Bits() < arp.MaxScanPrefixBits {
-		m.showNotice("LAN 검색 제한", arp.ErrSubnetTooLarge.Error(), true, screenTargetForm)
+	if _, err := arp.CollectScanTargets(lanInfo); err != nil {
+		title := "LAN 검색 불가"
+		if errors.Is(err, arp.ErrSubnetTooLarge) {
+			title = "LAN 검색 제한"
+		}
+		m.showNotice(title, err.Error(), true, screenTargetForm)
 		return m, nil
 	}
 

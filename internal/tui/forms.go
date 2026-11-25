@@ -488,12 +488,6 @@ func (m *Model) buildGlobalForm() *huh.Form {
 	if len(lanOpts) == 0 {
 		addOption("eth0", "기본값")
 		addOption("wg0", "기본값")
-	} else if len(lanOpts) < 2 {
-		if !seenNames["wg0"] {
-			addOption("wg0", "기본값")
-		} else {
-			addOption("eth0", "기본값")
-		}
 	}
 
 	fields := []huh.Field{

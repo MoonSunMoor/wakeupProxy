@@ -65,22 +65,25 @@ func TestNonRootIsAwakeAndLookupMACArePassive(t *testing.T) {
 		}
 	}
 
-	// Netlink failure falls back to /proc/net/arp passively
-	chkFallback := SystemChecker{
+	// Netlink failure in IsAwake must return (false, nlErr) rather than falling back to /proc/net/arp
+	// (because /proc/net/arp exposes NUD_STALE entries as 0x2 ATF_COM and would misclassify sleeping hosts).
+	nlBoom := errors.New("netlink unavailable")
+	chkNetlinkErr := SystemChecker{
 		rawQuery: func(context.Context, netutil.InterfaceInfo, []netip.Addr, time.Duration, bool) (map[netip.Addr]string, error) {
 			return nil, unix.EPERM
 		},
 		netlinkLookup: func(int, netip.Addr) (uint16, string, bool, error) {
-			return 0, "", false, errors.New("netlink unavailable")
+			return 0, "", false, nlBoom
 		},
 		procLookup: func(string, netip.Addr) string {
 			return "aa:bb:cc:dd:ee:01"
 		},
 	}
-	if awake, err := chkFallback.IsAwake(context.Background(), lanIface, targetIP); err != nil || !awake {
-		t.Fatalf("expected /proc/net/arp fallback awake=true, got %v err=%v", awake, err)
+	if awake, err := chkNetlinkErr.IsAwake(context.Background(), lanIface, targetIP); awake || !errors.Is(err, nlBoom) {
+		t.Fatalf("expected IsAwake on netlink failure to return (false, nlBoom) without /proc/net/arp false positive, got awake=%v err=%v", awake, err)
 	}
-	if mac, reason := chkFallback.LookupMAC(context.Background(), lanIface, targetIP); mac != "aa:bb:cc:dd:ee:01" || reason != "" {
+	// LookupMAC still falls back to /proc/net/arp passively for cached MAC discovery
+	if mac, reason := chkNetlinkErr.LookupMAC(context.Background(), lanIface, targetIP); mac != "aa:bb:cc:dd:ee:01" || reason != "" {
 		t.Fatalf("expected LookupMAC fallback to /proc/net/arp, got mac=%q reason=%q", mac, reason)
 	}
 
@@ -103,5 +106,41 @@ func TestNonRootIsAwakeAndLookupMACArePassive(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
 		t.Fatalf("expected passive LookupMAC miss to return immediately, took %v", elapsed)
+	}
+}
+
+func TestScanSubnetMultiSubnetLinux(t *testing.T) {
+	lanIface := netutil.InterfaceInfo{
+		Name:         "eth0",
+		Index:        2,
+		HardwareAddr: net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
+		Prefixes: []netip.Prefix{
+			netip.MustParsePrefix("192.168.0.10/24"),
+			netip.MustParsePrefix("192.168.10.10/24"),
+		},
+	}
+
+	var gotTargetCount int
+	chk := SystemChecker{
+		rawQuery: func(_ context.Context, _ netutil.InterfaceInfo, targets []netip.Addr, _ time.Duration, _ bool) (map[netip.Addr]string, error) {
+			gotTargetCount = len(targets)
+			return map[netip.Addr]string{
+				netip.MustParseAddr("192.168.10.22"): "aa:bb:cc:dd:ee:02",
+				netip.MustParseAddr("192.168.0.21"):  "aa:bb:cc:dd:ee:01",
+			}, nil
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	hosts, err := chk.ScanSubnet(ctx, lanIface)
+	if err != nil {
+		t.Fatalf("ScanSubnet multi-subnet failed: %v", err)
+	}
+	if gotTargetCount != 508 {
+		t.Fatalf("expected 508 scan targets across two /24 subnets, got %d", gotTargetCount)
+	}
+	if len(hosts) != 2 || hosts[0].IP != netip.MustParseAddr("192.168.0.21") || hosts[1].IP != netip.MustParseAddr("192.168.10.22") {
+		t.Fatalf("unexpected sorted scan results: %+v", hosts)
 	}
 }

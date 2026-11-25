@@ -2,6 +2,7 @@ package arp
 
 import (
 	"encoding/binary"
+	"errors"
 	"net"
 	"net/netip"
 	"strings"
@@ -85,5 +86,68 @@ func TestSelectSourceIPMultiSubnet(t *testing.T) {
 	fallback, ok := SelectSourceIP(lanIface, netip.MustParseAddr("10.0.0.5"))
 	if !ok || fallback != netip.MustParseAddr("192.168.0.10") {
 		t.Fatalf("expected fallback to primary 192.168.0.10, got %v (ok=%v)", fallback, ok)
+	}
+}
+
+func TestCollectScanTargetsMultiSubnetAndLimits(t *testing.T) {
+	// 1. No IPv4 prefixes -> error (not ErrSubnetTooLarge)
+	if _, err := CollectScanTargets(netutil.InterfaceInfo{Name: "eth0"}); err == nil || errors.Is(err, ErrSubnetTooLarge) {
+		t.Fatalf("expected missing-subnet error for empty prefixes, got %v", err)
+	}
+
+	// 2. Two disjoint /24 subnets -> 508 hosts covering both subnets
+	two24 := netutil.InterfaceInfo{
+		Name: "eth0",
+		Prefixes: []netip.Prefix{
+			netip.MustParsePrefix("192.168.0.10/24"),
+			netip.MustParsePrefix("192.168.10.10/24"),
+		},
+	}
+	targets, err := CollectScanTargets(two24)
+	if err != nil || len(targets) != 508 {
+		t.Fatalf("expected 508 targets across two /24 subnets, got len=%d err=%v", len(targets), err)
+	}
+	if targets[0] != netip.MustParseAddr("192.168.0.1") || targets[len(targets)-1] != netip.MustParseAddr("192.168.10.254") {
+		t.Fatalf("unexpected first/last target: %v .. %v", targets[0], targets[len(targets)-1])
+	}
+
+	// 3. Overlapping /22 and /24 deduplicates cleanly to 1,022 hosts (within MaxScanHosts)
+	overlap := netutil.InterfaceInfo{
+		Name: "eth0",
+		Prefixes: []netip.Prefix{
+			netip.MustParsePrefix("192.168.0.10/22"),
+			netip.MustParsePrefix("192.168.1.10/24"),
+		},
+	}
+	deduped, err := CollectScanTargets(overlap)
+	if err != nil || len(deduped) != MaxScanHosts {
+		t.Fatalf("expected %d deduplicated targets, got len=%d err=%v", MaxScanHosts, len(deduped), err)
+	}
+
+	// 4. Secondary prefix larger than /22 (e.g. /21) -> ErrSubnetTooLarge
+	secondTooLarge := netutil.InterfaceInfo{
+		Name: "eth0",
+		Prefixes: []netip.Prefix{
+			netip.MustParsePrefix("192.168.0.10/24"),
+			netip.MustParsePrefix("10.0.0.1/21"),
+		},
+	}
+	if _, err := CollectScanTargets(secondTooLarge); !errors.Is(err, ErrSubnetTooLarge) {
+		t.Fatalf("expected ErrSubnetTooLarge when secondary prefix is /21, got %v", err)
+	}
+
+	// 5. Five disjoint /24 prefixes (5 * 254 = 1,270 > 1,022) -> ErrSubnetTooLarge
+	five24 := netutil.InterfaceInfo{
+		Name: "eth0",
+		Prefixes: []netip.Prefix{
+			netip.MustParsePrefix("192.168.1.1/24"),
+			netip.MustParsePrefix("192.168.2.1/24"),
+			netip.MustParsePrefix("192.168.3.1/24"),
+			netip.MustParsePrefix("192.168.4.1/24"),
+			netip.MustParsePrefix("192.168.5.1/24"),
+		},
+	}
+	if _, err := CollectScanTargets(five24); !errors.Is(err, ErrSubnetTooLarge) {
+		t.Fatalf("expected ErrSubnetTooLarge when combined /24 host count exceeds 1022, got %v", err)
 	}
 }

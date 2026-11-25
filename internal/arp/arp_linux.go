@@ -88,12 +88,14 @@ func (c SystemChecker) IsAwake(ctx context.Context, lanIface netutil.InterfaceIn
 	}
 
 	// Unprivileged path (EPERM/EACCES) or raw socket unavailable:
-	// passively read kernel neighbor table (Netlink RTM_GETNEIGH, falling back to /proc/net/arp).
+	// passively read kernel neighbor table via Netlink RTM_GETNEIGH only.
+	// Never fall back to /proc/net/arp here because NUD_STALE entries still appear as
+	// 0x2 (ATF_COM) in /proc/net/arp and would falsely mark sleeping hosts as awake.
 	st, _, ok, nlErr := c.doNetlinkLookup(lanIface.Index, ip)
-	if nlErr == nil {
-		return ok && isNeighborActive(st), nil
+	if nlErr != nil {
+		return false, nlErr
 	}
-	return c.doProcLookup(lanIface.Name, ip) != "", nil
+	return ok && isNeighborActive(st), nil
 }
 
 func (c SystemChecker) LookupMAC(ctx context.Context, lanIface netutil.InterfaceInfo, ip netip.Addr) (string, string) {
@@ -126,18 +128,14 @@ func (c SystemChecker) LookupMAC(ctx context.Context, lanIface netutil.Interface
 }
 
 func (c SystemChecker) ScanSubnet(ctx context.Context, lanIface netutil.InterfaceInfo) ([]DiscoveredHost, error) {
-	if os.Geteuid() != 0 {
+	if c.rawQuery == nil && os.Geteuid() != 0 {
 		return nil, ErrRootRequired
 	}
-	prefix, ok := lanIface.PrimaryPrefix()
-	if !ok {
-		return nil, fmt.Errorf("LAN 인터페이스(%s)에 IPv4 서브넷이 없습니다", lanIface.Name)
-	}
-	if prefix.Bits() < MaxScanPrefixBits {
-		return nil, ErrSubnetTooLarge
+	targets, err := CollectScanTargets(lanIface)
+	if err != nil {
+		return nil, err
 	}
 
-	targets := netutil.SubnetHosts(prefix)
 	found, err := c.doRawQuery(ctx, lanIface, targets, 750*time.Millisecond, false)
 	if err != nil {
 		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {

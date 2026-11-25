@@ -645,6 +645,44 @@ func TestGlobalFormRejectsLowProxyPortAndLANIngressOverlap(t *testing.T) {
 	if len(m.form.Errors()) == 0 {
 		t.Fatal("expected Global Form ingress_interfaces validator to reject selecting lan_interface")
 	}
+
+	// Verify single-interface host does NOT inject synthetic wg0/eth0 options not in system or draft
+	m.deps.Interfaces = netutil.StaticProvider{
+		Items: []netutil.InterfaceInfo{
+			{Name: "enp1s0", Index: 2, Prefixes: []netip.Prefix{netip.MustParsePrefix("192.168.0.10/24")}, Up: true},
+		},
+	}
+	m.gDraft.lanInterface = "enp1s0"
+	m.gDraft.ingressInterfaces = []string{"enp1s0"}
+	m.form = m.buildGlobalForm()
+	_ = m.form.Init()
+	gView := m.View()
+	if strings.Contains(gView, "wg0") || strings.Contains(gView, "eth0") {
+		t.Fatalf("expected Global Form not to inject synthetic wg0/eth0 when host has enp1s0, got:\n%s", gView)
+	}
+}
+
+func TestTUILANScanChecksAllSubnetsForSizeLimit(t *testing.T) {
+	m, _, _, _, _ := setupTestModel(t, true)
+	m.deps.Interfaces = netutil.StaticProvider{
+		Items: []netutil.InterfaceInfo{
+			{
+				Name:         "eth0",
+				Index:        2,
+				HardwareAddr: net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
+				Prefixes: []netip.Prefix{
+					netip.MustParsePrefix("192.168.0.10/24"),
+					netip.MustParsePrefix("10.0.0.10/16"), // secondary prefix > /22!
+				},
+				Up: true,
+			},
+		},
+	}
+	m = sendFormKey(m, "a")
+	m, _ = sendKey(m, "ctrl+l")
+	if m.screen != screenNotice || m.noticeTitle != "LAN 검색 제한" {
+		t.Fatalf("expected LAN scan blocked when secondary subnet exceeds /22, got screen=%v title=%q", m.screen, m.noticeTitle)
+	}
 }
 
 func TestTUIMultiSubnetWakeBroadcastSelection(t *testing.T) {
