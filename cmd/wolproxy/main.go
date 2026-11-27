@@ -293,7 +293,7 @@ func runWakeWithDeps(
 		arpChecker = arp.NewSystemChecker()
 	}
 	arpProbe := func(pCtx context.Context, ip netip.Addr) (bool, error) {
-		return arpChecker.IsAwake(pCtx, lanInfo, ip)
+		return arpChecker.ProbeAwake(pCtx, lanInfo, ip)
 	}
 
 	dialFn := customDial

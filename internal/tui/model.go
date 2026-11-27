@@ -29,6 +29,7 @@ type screenKind int
 
 const (
 	screenList screenKind = iota
+	screenTargetDetail
 	screenTargetForm
 	screenClientForm
 	screenProfileForm
@@ -255,23 +256,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case arpPeriodicTickMsg:
 		var cmds []tea.Cmd
 		cmds = append(cmds, m.scheduleARPTickCmd())
-		if m.tab == tabTargets && m.screen == screenList {
+		if m.tab == tabTargets && (m.screen == screenList || m.screen == screenTargetDetail) {
 			cmds = append(cmds, m.checkTargetsARPCmd())
 		}
 		return m, tea.Batch(cmds...)
 
 	case wakingPollTickMsg:
-		if !m.hasWakingTargets() {
-			// Expire any timed-out waking statuses
-			now := time.Now()
-			for name, st := range m.targetStatus {
-				if st.state == statusWaking && !now.Before(st.wakeDeadline) {
-					m.targetStatus[name] = targetRuntimeStatus{state: statusAsleep}
-				}
+		now := time.Now()
+		for name, st := range m.targetStatus {
+			if st.state == statusWaking && !now.Before(st.wakeDeadline) {
+				m.targetStatus[name] = targetRuntimeStatus{state: statusAsleep}
 			}
+		}
+		if !m.hasWakingTargets() {
 			return m, nil
 		}
-		return m, tea.Batch(m.checkTargetsARPCmd(), m.scheduleWakingTickCmd())
+		return m, tea.Batch(m.checkWakingTargetsARPCmd(), m.scheduleWakingTickCmd())
 
 	case arpResultsMsg:
 		now := time.Now()
@@ -387,6 +387,9 @@ func (m *Model) View() string {
 		case tabGlobal:
 			b.WriteString(m.renderGlobalSummary())
 		}
+
+	case screenTargetDetail:
+		b.WriteString(m.renderTargetDetailModal())
 
 	case screenTargetForm, screenClientForm, screenProfileForm, screenGlobalForm:
 		if m.form != nil {

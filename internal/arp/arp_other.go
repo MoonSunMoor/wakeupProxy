@@ -21,6 +21,10 @@ func (SystemChecker) IsAwake(_ context.Context, _ netutil.InterfaceInfo, _ netip
 	return false, errors.New("ARP 조회는 Linux에서만 지원됩니다")
 }
 
+func (SystemChecker) ProbeAwake(_ context.Context, _ netutil.InterfaceInfo, _ netip.Addr) (bool, error) {
+	return false, errors.New("ARP 조회는 Linux에서만 지원됩니다")
+}
+
 func (SystemChecker) LookupMAC(_ context.Context, _ netutil.InterfaceInfo, _ netip.Addr) (string, string) {
 	return "", "ARP 기록 조회는 Linux에서만 지원됩니다"
 }

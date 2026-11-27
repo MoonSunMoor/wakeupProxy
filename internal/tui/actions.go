@@ -44,8 +44,38 @@ func (m *Model) checkTargetsARPCmd() tea.Cmd {
 	if len(m.cfg.Targets) == 0 {
 		return nil
 	}
+	now := time.Now()
+	wakingSet := make(map[string]bool)
+	for name, st := range m.targetStatus {
+		if st.state == statusWaking && now.Before(st.wakeDeadline) {
+			wakingSet[name] = true
+		}
+	}
+	return m.runTargetsARPCheckCmd(m.cfg.Targets, wakingSet)
+}
+
+func (m *Model) checkWakingTargetsARPCmd() tea.Cmd {
+	if len(m.cfg.Targets) == 0 {
+		return nil
+	}
+	now := time.Now()
+	wakingSet := make(map[string]bool)
+	var targets []config.Target
+	for _, t := range m.cfg.Targets {
+		if st, ok := m.targetStatus[t.Name]; ok && st.state == statusWaking && now.Before(st.wakeDeadline) {
+			wakingSet[t.Name] = true
+			targets = append(targets, t)
+		}
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	return m.runTargetsARPCheckCmd(targets, wakingSet)
+}
+
+func (m *Model) runTargetsARPCheckCmd(targets []config.Target, probeSet map[string]bool) tea.Cmd {
 	lanName := m.cfg.LANInterface
-	targetsCopy := append([]config.Target(nil), m.cfg.Targets...)
+	targetsCopy := append([]config.Target(nil), targets...)
 	ifaces := m.deps.Interfaces
 	arpChecker := m.deps.ARP
 
@@ -66,10 +96,17 @@ func (m *Model) checkTargetsARPCmd() tea.Cmd {
 				continue
 			}
 			tName := t.Name
+			useProbe := probeSet[tName]
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				ok, err := arpChecker.IsAwake(ctx, lanInfo, ipAddr)
+				var ok bool
+				var err error
+				if useProbe {
+					ok, err = arpChecker.ProbeAwake(ctx, lanInfo, ipAddr)
+				} else {
+					ok, err = arpChecker.IsAwake(ctx, lanInfo, ipAddr)
+				}
 				if err == nil {
 					mu.Lock()
 					res[tName] = ok

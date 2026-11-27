@@ -45,6 +45,7 @@ type DiscoveredHost struct {
 // Checker provides ARP reachability checks, kernel ARP table MAC lookup, and LAN subnet scanning.
 type Checker interface {
 	IsAwake(ctx context.Context, lanIface netutil.InterfaceInfo, ip netip.Addr) (bool, error)
+	ProbeAwake(ctx context.Context, lanIface netutil.InterfaceInfo, ip netip.Addr) (bool, error)
 	LookupMAC(ctx context.Context, lanIface netutil.InterfaceInfo, ip netip.Addr) (mac string, reason string)
 	ScanSubnet(ctx context.Context, lanIface netutil.InterfaceInfo) ([]DiscoveredHost, error)
 }

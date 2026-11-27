@@ -82,8 +82,14 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case screenNotice:
-		if keyStr == "esc" || keyStr == "enter" || keyStr == " " {
+		if keyStr == "esc" || keyStr == "enter" || keyStr == " " || msg.Type == tea.KeySpace {
 			m.screen = m.prevScreen
+		}
+		return m, nil
+
+	case screenTargetDetail:
+		if keyStr == "esc" || keyStr == "enter" || keyStr == " " || msg.Type == tea.KeySpace {
+			m.screen = screenList
 		}
 		return m, nil
 
@@ -169,6 +175,13 @@ func (m *Model) handleListKey(keyStr string) (tea.Model, tea.Cmd) {
 
 	case "enter":
 		if !m.deps.IsRoot {
+			if m.tab == tabTargets {
+				if len(m.cfg.Targets) == 0 {
+					return m, nil
+				}
+				m.screen = screenTargetDetail
+				return m, nil
+			}
 			m.showReadOnlyNotice()
 			return m, nil
 		}

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoonSunMoor/wakeupProxy/internal/arp"
 	"github.com/MoonSunMoor/wakeupProxy/internal/daemon"
 	"github.com/MoonSunMoor/wakeupProxy/internal/netutil"
 	"github.com/MoonSunMoor/wakeupProxy/internal/proxy"
@@ -449,5 +450,66 @@ targets:
 	}
 	if !dialedTargets["192.168.0.21"] || !dialedTargets["192.168.10.22"] {
 		t.Fatalf("expected both targets polled during --wait, got %v", dialedTargets)
+	}
+}
+
+type probeTrackingARP struct {
+	isAwakeCalls    atomic.Int32
+	probeAwakeCalls atomic.Int32
+}
+
+func (p *probeTrackingARP) IsAwake(_ context.Context, _ netutil.InterfaceInfo, _ netip.Addr) (bool, error) {
+	p.isAwakeCalls.Add(1)
+	return true, nil
+}
+
+func (p *probeTrackingARP) ProbeAwake(_ context.Context, _ netutil.InterfaceInfo, _ netip.Addr) (bool, error) {
+	return p.probeAwakeCalls.Add(1) >= 2, nil
+}
+
+func (p *probeTrackingARP) LookupMAC(_ context.Context, _ netutil.InterfaceInfo, _ netip.Addr) (string, string) {
+	return "", ""
+}
+
+func (p *probeTrackingARP) ScanSubnet(_ context.Context, _ netutil.InterfaceInfo) ([]arp.DiscoveredHost, error) {
+	return nil, nil
+}
+
+func TestRunWakeWaitUsesProbeAwakeForProfilelessTarget(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "profileless.yaml")
+	cfgYAML := `lan_interface: eth0
+ingress_interfaces: [wg0]
+proxy_port: 13389
+wake_timeout: 1s
+wake_cooldown: 500ms
+poll_interval: 20ms
+clients: {}
+profiles: {}
+targets:
+  - name: nas-only
+    ip: 192.168.0.50
+    mac: "aa:bb:cc:dd:ee:50"
+`
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ifaces := netutil.StaticProvider{
+		Items: []netutil.InterfaceInfo{
+			{Name: "eth0", Index: 2, Prefixes: []netip.Prefix{netip.MustParsePrefix("192.168.0.10/24")}, Up: true},
+		},
+	}
+	arpStub := &probeTrackingARP{}
+	sender := &recordingSender{}
+	var stderr bytes.Buffer
+	code := runWakeWithDeps(cfgPath, []string{"nas-only", "--wait"}, &stderr, ifaces, sender, nil, arpStub)
+	if code != 0 {
+		t.Fatalf("expected runWakeWithDeps --wait to succeed via ProbeAwake, got %d (%s)", code, stderr.String())
+	}
+	if arpStub.isAwakeCalls.Load() != 0 {
+		t.Fatalf("expected wake --wait NOT to call passive IsAwake, got %d", arpStub.isAwakeCalls.Load())
+	}
+	if arpStub.probeAwakeCalls.Load() < 2 {
+		t.Fatalf("expected wake --wait to poll via ProbeAwake, got %d", arpStub.probeAwakeCalls.Load())
 	}
 }

@@ -2063,3 +2063,156 @@ func TestIdleStateRingBufferLongWindowAndZeroAlloc(t *testing.T) {
 		t.Fatalf("expected 0 allocs/op in idleState.check ring buffer, got %v", allocs)
 	}
 }
+
+func TestMultiPortBootECONNREFUSEDJoinsActiveWakeWhileWakeNeverCloses(t *testing.T) {
+	_, backendPort := startEchoBackend(t)
+
+	// Closed local port guaranteed to return real OS ECONNREFUSED / WSAECONNREFUSED
+	closedLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedPort := closedLn.Addr().(*net.TCPAddr).Port
+	_ = closedLn.Close()
+
+	probeLn, _ := net.Listen("tcp4", "127.0.0.1:0")
+	proxyPort := probeLn.Addr().(*net.TCPAddr).Port
+	_ = probeLn.Close()
+
+	cfg := &config.Config{
+		LANInterface:      "eth0",
+		IngressInterfaces: []string{"wg0"},
+		ProxyPort:         proxyPort,
+		WakeTimeout:       config.Duration(3 * time.Second),
+		WakeCooldown:      config.Duration(5 * time.Second),
+		PollInterval:      config.Duration(40 * time.Millisecond),
+		Clients:           map[string]config.Client{"laptop": {CIDR: "127.0.0.1/32"}},
+		Profiles: map[string]config.Profile{
+			"ssh":   {Port: 22, Wake: config.WakeAuto},
+			"rdp":   {Port: 3389, Wake: config.WakeAuto},
+			"admin": {Port: 8080, Wake: config.WakeNever},
+		},
+		Targets: []config.Target{{
+			Name:     "pc1",
+			IP:       "192.168.0.21",
+			MAC:      "aa:bb:cc:dd:ee:01",
+			Profiles: []string{"ssh", "rdp", "admin"},
+			Allow:    []string{"laptop"},
+		}},
+	}
+
+	// Phase: 0 = sleeping (EHOSTUNREACH)
+	//        1 = OS booting (network stack up -> real ECONNREFUSED on all ports)
+	//        2 = services ready (connects to echo backend)
+	var phase atomic.Int32
+	var nextOrigDst atomic.Value
+	wolMock := &fakeWoLSender{}
+
+	srv := NewServer(Options{
+		Interfaces: testProxyInterfaces(),
+		NFT:        &fakeNFT{},
+		WoLSender:  wolMock,
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		OrigDst: func(_ net.Conn) (netip.AddrPort, error) {
+			return nextOrigDst.Load().(netip.AddrPort), nil
+		},
+		Dial: func(ctx context.Context, _ string) (net.Conn, error) {
+			switch phase.Load() {
+			case 0:
+				return nil, syscall.EHOSTUNREACH
+			case 1:
+				var d net.Dialer
+				return d.DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", intToStr(closedPort)))
+			default:
+				var d net.Dialer
+				return d.DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", intToStr(backendPort)))
+			}
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown(context.Background())
+
+	listenAddr := srv.ListenerAddrs()[0]
+
+	// 1. Port 22 (wake: auto) arrives while sleeping -> starts target wake cycle
+	nextOrigDst.Store(netip.MustParseAddrPort("192.168.0.21:22"))
+	cSSH, err := net.Dial("tcp4", listenAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cSSH.Close()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		srv.connsMu.Lock()
+		w := srv.waitingByTarget["pc1"]
+		srv.connsMu.Unlock()
+		if w == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 2. Target enters boot transition (real ECONNREFUSED on initial 1s dial):
+	//    - Port 8080 (wake: never) must close immediately without joining wake!
+	//    - Port 3389 (wake: auto) must see HasActiveWake(pc1)==true and join wake wait!
+	phase.Store(1)
+
+	nextOrigDst.Store(netip.MustParseAddrPort("192.168.0.21:8080"))
+	cNever, err := net.Dial("tcp4", listenAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = cNever.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+	if _, err := cNever.Read(make([]byte, 4)); err == nil {
+		_ = cNever.Close()
+		t.Fatal("expected wake:never port 8080 to close immediately on ECONNREFUSED even while pc1 wake is active")
+	}
+	_ = cNever.Close()
+
+	nextOrigDst.Store(netip.MustParseAddrPort("192.168.0.21:3389"))
+	cRDP, err := net.Dial("tcp4", listenAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cRDP.Close()
+
+	deadline = time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		srv.connsMu.Lock()
+		w := srv.waitingByTarget["pc1"]
+		srv.connsMu.Unlock()
+		if w == 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	srv.connsMu.Lock()
+	gotWaiting := srv.waitingByTarget["pc1"]
+	srv.connsMu.Unlock()
+	if gotWaiting != 2 {
+		t.Fatalf("expected port 3389 (wake:auto) hitting boot ECONNREFUSED to join active pc1 wake (2 waiters), got %d", gotWaiting)
+	}
+
+	// 3. Services finish starting -> both SSH and RDP connections relay end-to-end!
+	phase.Store(2)
+	for name, conn := range map[string]net.Conn{"ssh": cSSH, "rdp": cRDP} {
+		_ = conn.SetDeadline(time.Now().Add(time.Second))
+		payload := []byte("ok-" + name)
+		if _, err := conn.Write(payload); err != nil {
+			t.Fatalf("%s write after wake failed: %v", name, err)
+		}
+		got := make([]byte, len(payload))
+		if _, err := io.ReadFull(conn, got); err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("%s relay mismatch: got %q err=%v", name, got, err)
+		}
+	}
+	if got := wolMock.packets.Load(); got != 1 {
+		t.Fatalf("expected single coalesced magic packet across SSH+RDP wake cycle, got %d", got)
+	}
+}
