@@ -266,7 +266,11 @@ func (m *Model) renderProfilesList() string {
 
 func (m *Model) renderGlobalSummary() string {
 	var b strings.Builder
-	b.WriteString(headerRowStyle.Render("전역 설정 (Enter를 눌러 편집 폼 열기)"))
+	if m.deps.IsRoot {
+		b.WriteString(headerRowStyle.Render("전역 설정 (Enter를 눌러 편집 폼 열기)"))
+	} else {
+		b.WriteString(headerRowStyle.Render("전역 설정 (읽기 전용 - 편집하려면 sudo 필요)"))
+	}
 	b.WriteString("\n\n")
 	ing := strings.Join(m.cfg.IngressInterfaces, ", ")
 	if ing == "" {
@@ -421,13 +425,56 @@ func (m *Model) renderNoticeModal(title, body string, isErr bool) string {
 	return boxStyle.Render(b.String())
 }
 
+func (m *Model) renderTargetDetailModal() string {
+	if len(m.cfg.Targets) == 0 {
+		return ""
+	}
+	idx := clampIndex(m.targetCursor, len(m.cfg.Targets))
+	t := m.cfg.Targets[idx]
+
+	orNone := func(s string) string {
+		if strings.TrimSpace(s) == "" {
+			return "(없음)"
+		}
+		return s
+	}
+	joinOrNone := func(items []string) string {
+		if len(items) == 0 {
+			return "(없음)"
+		}
+		return strings.Join(items, ", ")
+	}
+
+	var b strings.Builder
+	b.WriteString(headerRowStyle.Render(fmt.Sprintf("타깃 상세 보기: %s", t.Name)))
+	b.WriteString("\n\n")
+	rows := [][2]string{
+		{"이름", t.Name},
+		{"IP", t.IP},
+		{"별칭", orNone(t.Alias)},
+		{"MAC", t.MAC},
+		{"프로파일", joinOrNone(t.Profiles)},
+		{"허용 클라이언트 (allow)", joinOrNone(t.Allow)},
+		{"상태", m.formatTargetStatus(t.Name)},
+		{"note", orNone(t.Note)},
+	}
+	for _, kv := range rows {
+		b.WriteString("  " + padRight(kv[0], 26) + kv[1] + "\n")
+	}
+	b.WriteByte('\n')
+	b.WriteString(mutedStyle.Render("설정을 편집하거나 저장하려면 sudo로 실행해 주세요."))
+	b.WriteByte('\n')
+	b.WriteString(mutedStyle.Render("(Enter, Esc 또는 공백으로 닫기)"))
+	return boxStyle.Render(b.String())
+}
+
 func (m *Model) renderHelpModal() string {
 	helpText := `키 조작 안내
 
   [탭 및 목록]
   Tab / Shift+Tab  다음·이전 탭 이동 (편집 폼에서는 다음·이전 필드 이동)
   ↑ ↓ / j k        목록 항목 이동
-  Enter            선택한 항목 편집 폼 열기
+  Enter            선택한 항목 편집 폼 열기 (비-root 타깃 목록에서는 상세 보기)
   a                새 항목 추가 (프로파일은 프리셋 선택 후 열림)
   d                항목 삭제 (다른 타깃이 참조 중이면 차단)
 
@@ -448,14 +495,27 @@ func (m *Model) renderFooter() string {
 	var keys string
 	switch m.screen {
 	case screenList:
-		switch m.tab {
-		case tabTargets:
-			keys = "Tab/Shift+Tab: 탭 이동 | ↑↓/jk: 이동 | Enter: 편집 | a: 추가 | d: 삭제 | w: 깨우기 | t: 포트 테스트 | s: 저장·적용 | ?: 도움말 | q: 종료"
-		case tabGlobal:
-			keys = "Tab/Shift+Tab: 탭 이동 | Enter: 편집 폼 열기 | s: 저장·적용 | ?: 도움말 | q: 종료"
-		default:
-			keys = "Tab/Shift+Tab: 탭 이동 | ↑↓/jk: 이동 | Enter: 편집 | a: 추가 | d: 삭제 | s: 저장·적용 | ?: 도움말 | q: 종료"
+		if !m.deps.IsRoot {
+			switch m.tab {
+			case tabTargets:
+				keys = "Tab/Shift+Tab: 탭 이동 | ↑↓/jk: 이동 | Enter: 상세 보기 | w: 깨우기 | t: 포트 테스트 | ?: 도움말 | q: 종료"
+			case tabGlobal:
+				keys = "Tab/Shift+Tab: 탭 이동 | ?: 도움말 | q: 종료"
+			default:
+				keys = "Tab/Shift+Tab: 탭 이동 | ↑↓/jk: 이동 | ?: 도움말 | q: 종료"
+			}
+		} else {
+			switch m.tab {
+			case tabTargets:
+				keys = "Tab/Shift+Tab: 탭 이동 | ↑↓/jk: 이동 | Enter: 편집 | a: 추가 | d: 삭제 | w: 깨우기 | t: 포트 테스트 | s: 저장·적용 | ?: 도움말 | q: 종료"
+			case tabGlobal:
+				keys = "Tab/Shift+Tab: 탭 이동 | Enter: 편집 폼 열기 | s: 저장·적용 | ?: 도움말 | q: 종료"
+			default:
+				keys = "Tab/Shift+Tab: 탭 이동 | ↑↓/jk: 이동 | Enter: 편집 | a: 추가 | d: 삭제 | s: 저장·적용 | ?: 도움말 | q: 종료"
+			}
 		}
+	case screenTargetDetail:
+		keys = "Enter / Esc / Space: 닫기 | ?: 도움말"
 	case screenTargetForm:
 		keys = "Tab/Shift+Tab: 필드 이동 | Enter: 다음/완료 | Ctrl+L: LAN 검색 | Esc: 취소 | Ctrl+S: 저장·적용"
 	case screenClientForm, screenProfileForm, screenGlobalForm:

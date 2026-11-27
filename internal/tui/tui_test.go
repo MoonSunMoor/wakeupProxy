@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -44,12 +45,37 @@ func (s *fakeService) RecentLogs(_ context.Context, _ int) string {
 }
 
 type fakeARP struct {
-	awake map[netip.Addr]bool
-	macs  map[netip.Addr]string
-	hosts []arp.DiscoveredHost
+	mu          sync.Mutex
+	awake       map[netip.Addr]bool
+	probeAwake  map[netip.Addr]bool
+	macs        map[netip.Addr]string
+	hosts       []arp.DiscoveredHost
+	isAwakeHits map[netip.Addr]int
+	probeHits   map[netip.Addr]int
 }
 
 func (a *fakeARP) IsAwake(_ context.Context, _ netutil.InterfaceInfo, ip netip.Addr) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.isAwakeHits == nil {
+		a.isAwakeHits = make(map[netip.Addr]int)
+	}
+	a.isAwakeHits[ip]++
+	return a.awake[ip], nil
+}
+
+func (a *fakeARP) ProbeAwake(_ context.Context, _ netutil.InterfaceInfo, ip netip.Addr) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.probeHits == nil {
+		a.probeHits = make(map[netip.Addr]int)
+	}
+	a.probeHits[ip]++
+	if a.probeAwake != nil {
+		if v, ok := a.probeAwake[ip]; ok {
+			return v, nil
+		}
+	}
 	return a.awake[ip], nil
 }
 
@@ -196,6 +222,147 @@ func TestReadOnlyModeBlocksSaveWithSudoNotice(t *testing.T) {
 	}
 	if svc.reloads != 0 || svc.restarts != 0 {
 		t.Fatal("non-root must never reload or restart service")
+	}
+}
+
+func TestNonRootTargetDetailModalFooterAndWakingProbeSplit(t *testing.T) {
+	m, _, _, arpMock, wolMock := setupTestModel(t, false)
+
+	// Add a second target with empty optional fields to verify "(없음)" rendering as well
+	m.cfg.Targets[0].Alias = "10.66.1.21"
+	m.cfg.Targets[0].Note = "거실 PC"
+	m.cfg.Targets = append(m.cfg.Targets, config.Target{
+		Name: "nas-bare",
+		IP:   "192.168.0.50",
+		MAC:  "aa:bb:cc:dd:ee:50",
+	})
+	m.targetStatus["pc1"] = targetRuntimeStatus{state: statusAwake}
+
+	// 1. Non-root footer on tabTargets reflects actual allowed actions
+	footerTargets := m.renderFooter()
+	if !strings.Contains(footerTargets, "Enter: 상세 보기") ||
+		!strings.Contains(footerTargets, "w: 깨우기") ||
+		!strings.Contains(footerTargets, "t: 포트 테스트") {
+		t.Fatalf("expected non-root target footer to advertise detail/w/t, got: %q", footerTargets)
+	}
+	if strings.Contains(footerTargets, "a: 추가") || strings.Contains(footerTargets, "d: 삭제") || strings.Contains(footerTargets, "s: 저장") {
+		t.Fatalf("expected non-root target footer not to advertise root-only edit actions, got: %q", footerTargets)
+	}
+
+	// 2. Pressing Enter on pc1 opens read-only target detail modal and closes via Enter / Esc / Space
+	m, _ = sendKey(m, "enter")
+	if m.screen != screenTargetDetail {
+		t.Fatalf("expected screenTargetDetail on non-root Enter in tabTargets, got %v", m.screen)
+	}
+	detail1 := m.View()
+	for _, want := range []string{
+		"이름", "pc1",
+		"IP", "192.168.0.21",
+		"별칭", "10.66.1.21",
+		"MAC", "aa:bb:cc:dd:ee:01",
+		"프로파일", "rdp",
+		"허용 클라이언트 (allow)", "laptop",
+		"상태", "깨어 있음",
+		"note", "거실 PC",
+		"설정을 편집하거나 저장하려면 sudo로 실행해 주세요.",
+	} {
+		if !strings.Contains(detail1, want) {
+			t.Fatalf("expected target detail modal to contain %q, got:\n%s", want, detail1)
+		}
+	}
+	m, _ = sendKey(m, " ") // close with Space
+	if m.screen != screenList {
+		t.Fatalf("expected Space to close screenTargetDetail, got %v", m.screen)
+	}
+
+	// Check second target with empty alias/profiles/allow/note renders "(없음)" and closes with Esc & Enter
+	m, _ = sendKey(m, "j")
+	m, _ = sendKey(m, "enter")
+	if m.screen != screenTargetDetail {
+		t.Fatalf("expected screenTargetDetail for nas-bare, got %v", m.screen)
+	}
+	detail2 := m.View()
+	if strings.Count(detail2, "(없음)") < 4 {
+		t.Fatalf("expected '(없음)' for empty alias, profiles, allow, and note, got:\n%s", detail2)
+	}
+	m, _ = sendKey(m, "esc")
+	if m.screen != screenList {
+		t.Fatalf("expected Esc to close screenTargetDetail, got %v", m.screen)
+	}
+	m, _ = sendKey(m, "enter")
+	m, _ = sendKey(m, "enter")
+	if m.screen != screenList {
+		t.Fatalf("expected Enter to close screenTargetDetail, got %v", m.screen)
+	}
+
+	// 3. 'w' works for non-root and wakingPollTickMsg uses ProbeAwake ONLY for waking target,
+	// while passive periodic tick uses IsAwake for non-waking targets and never misclassifies waking target.
+	ipPC1 := netip.MustParseAddr("192.168.0.21")
+	ipNAS := netip.MustParseAddr("192.168.0.50")
+	arpMock.awake[ipNAS] = true                            // Simulate NUD_DELAY false positive if IsAwake were used!
+	arpMock.probeAwake = map[netip.Addr]bool{ipNAS: false} // ProbeAwake requires NUD_REACHABLE -> still false!
+
+	m, wakeCmd := sendKey(m, "w") // cursor is on nas-bare (index 1)
+	next, _ := m.Update(wakeCmd())
+	m = next.(*Model)
+	if wolMock.sent != 1 || m.formatTargetStatus("nas-bare") != "깨우는 중" {
+		t.Fatalf("expected non-root 'w' to send magic packet and mark waking, sent=%d status=%q", wolMock.sent, m.formatTargetStatus("nas-bare"))
+	}
+
+	// Periodic tick while nas-bare is waking: pc1 checked via IsAwake, nas-bare checked via ProbeAwake (stays waking!)
+	next, pCmd := m.Update(arpPeriodicTickMsg{})
+	m = next.(*Model)
+	m = runImmediateCmd(m, pCmd, 0)
+	if m.formatTargetStatus("nas-bare") != "깨우는 중" {
+		t.Fatalf("expected nas-bare to remain '깨우는 중' when only IsAwake was true (NUD_DELAY) and ProbeAwake was false, got %q", m.formatTargetStatus("nas-bare"))
+	}
+
+	arpMock.mu.Lock()
+	pc1ProbeBefore := arpMock.probeHits[ipPC1]
+	arpMock.probeAwake[ipNAS] = true
+	arpMock.mu.Unlock()
+
+	// Waking poll tick: probes ONLY nas-bare via ProbeAwake -> transitions to "깨어 있음"
+	next, wCmd := m.Update(wakingPollTickMsg{})
+	m = next.(*Model)
+	m = runImmediateCmd(m, wCmd, 0)
+	if m.formatTargetStatus("nas-bare") != "깨어 있음" {
+		t.Fatalf("expected nas-bare to become '깨어 있음' once ProbeAwake returns true, got %q", m.formatTargetStatus("nas-bare"))
+	}
+	arpMock.mu.Lock()
+	pc1ProbeAfter := arpMock.probeHits[ipPC1]
+	nasProbeHits := arpMock.probeHits[ipNAS]
+	arpMock.mu.Unlock()
+	if pc1ProbeAfter != pc1ProbeBefore {
+		t.Fatalf("expected non-waking target pc1 never probed by ProbeAwake, got %d -> %d", pc1ProbeBefore, pc1ProbeAfter)
+	}
+	if nasProbeHits < 2 {
+		t.Fatalf("expected ProbeAwake called for waking target nas-bare, got %d", nasProbeHits)
+	}
+
+	// 4. Non-root Enter on Clients, Profiles, Global tabs and a/d/ctrl+s still show read-only notice
+	for _, key := range []string{"a", "d", "ctrl+s"} {
+		m, _ = sendKey(m, key)
+		if m.screen != screenNotice || !strings.Contains(m.noticeBody, "sudo") {
+			t.Fatalf("expected non-root %q on tabTargets to show sudo notice, got screen=%v", key, m.screen)
+		}
+		m, _ = sendKey(m, "esc")
+	}
+	for _, tabKey := range []string{"2", "3", "4"} {
+		m, _ = sendKey(m, tabKey)
+		m, _ = sendKey(m, "enter")
+		if m.screen != screenNotice || !strings.Contains(m.noticeBody, "sudo") {
+			t.Fatalf("expected non-root Enter on tab %s to show sudo notice, got screen=%v", tabKey, m.screen)
+		}
+		m, _ = sendKey(m, "esc")
+	}
+
+	// 5. Empty targets list: non-root Enter on tabTargets is a no-op (remains on screenList)
+	m, _ = sendKey(m, "1")
+	m.cfg.Targets = nil
+	m, _ = sendKey(m, "enter")
+	if m.screen != screenList {
+		t.Fatalf("expected non-root Enter with 0 targets to do nothing and stay on screenList, got %v", m.screen)
 	}
 }
 

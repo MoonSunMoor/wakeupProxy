@@ -1182,9 +1182,10 @@ func (s *Server) handleConn(clientConn net.Conn) {
 			PollInterval:  cur.pollInterval,
 			DialTimeout:   initialDialTimeout,
 		}
-		// Only wake on timeout / EHOSTUNREACH / ENETUNREACH (or join if a wake for this target+port
-		// is already in progress). If the target responded with ECONNREFUSED and no wake is active,
-		// the host is already awake with the service closed, so close immediately without waking.
+		// Only wake on timeout / EHOSTUNREACH / ENETUNREACH (or join if a wake cycle for this
+		// target is already in progress). If the target responded with ECONNREFUSED and no wake
+		// is active for the target, the host is already awake with the service closed, so close
+		// immediately without waking.
 		if !shouldWakeOnDialError(dialErr) && !s.coord.HasActiveWake(wakeReq) {
 			s.logConnClosed(tc, 0, time.Since(startedAt), tc.getReason(dialFailureReason(dialErr)))
 			return

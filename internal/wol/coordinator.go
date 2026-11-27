@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/MoonSunMoor/wakeupProxy/internal/netutil"
@@ -84,8 +85,12 @@ type WakeRequest struct {
 }
 
 type targetBeacon struct {
-	cancel  context.CancelFunc
-	waiters int
+	cancel      context.CancelFunc
+	waiters     int
+	portWaiters map[int]int
+	deadline    time.Time
+	retried     bool
+	retryCh     chan time.Duration
 }
 
 type portWakeCall struct {
@@ -93,12 +98,22 @@ type portWakeCall struct {
 	cancel    context.CancelFunc
 	waiters   int
 	startedAt time.Time
+	deadline  time.Time
 
 	// Protected by Coordinator.mu so waiter cancellation and poll completion
 	// synchronize atomically and never leak an unclaimed connection.
 	firstConn net.Conn
 	err       error
 	elapsed   time.Duration
+}
+
+func isCallDone(call *portWakeCall) bool {
+	select {
+	case <-call.done:
+		return true
+	default:
+		return false
+	}
 }
 
 func makeBeaconKey(req WakeRequest) string {
@@ -142,35 +157,73 @@ func NewCoordinator(sender Sender, dial DialFunc, logger *slog.Logger) *Coordina
 	}
 }
 
-func (c *Coordinator) acquireBeaconLocked(bKey string, req WakeRequest) {
+func (c *Coordinator) acquireBeaconLocked(bKey string, req WakeRequest, now time.Time) (*targetBeacon, time.Duration) {
 	if b, ok := c.beacons[bKey]; ok {
-		b.waiters++
-		return
+		if b.waiters > 0 && now.Before(b.deadline) {
+			rem := b.deadline.Sub(now)
+			// When remaining target deadline < wake_timeout/4 and a request arrives on
+			// another port with 0 active waiters while other port waiter(s) are active,
+			// allow at most one retry per target wake cycle: reset target deadline to
+			// now + wake_timeout and immediately transmit 1 magic packet + reset cooldown.
+			if !b.retried && b.portWaiters[req.Port] == 0 && rem < req.WakeTimeout/4 {
+				b.retried = true
+				b.deadline = now.Add(req.WakeTimeout)
+				rem = req.WakeTimeout
+				select {
+				case b.retryCh <- req.WakeCooldown:
+				default:
+				}
+			}
+			b.waiters++
+			b.portWaiters[req.Port]++
+			return b, rem
+		}
+		// Expired beacon racing right before cleanup: replace with a fresh wake cycle.
+		delete(c.beacons, bKey)
+		b.cancel()
 	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &targetBeacon{
-		cancel:  cancel,
-		waiters: 1,
+		cancel:      cancel,
+		waiters:     1,
+		portWaiters: map[int]int{req.Port: 1},
+		deadline:    now.Add(req.WakeTimeout),
+		retryCh:     make(chan time.Duration, 1),
 	}
 	c.beacons[bKey] = b
 
 	macCopy := append(net.HardwareAddr(nil), req.MAC...)
-	go c.runBeacon(ctx, req.TargetName, req.BroadcastAddr, macCopy, req.WakeCooldown)
+	go c.runBeacon(ctx, req.TargetName, req.BroadcastAddr, macCopy, req.WakeCooldown, b.retryCh)
+	return b, req.WakeTimeout
 }
 
-func (c *Coordinator) releaseBeaconLocked(bKey string) {
-	b, ok := c.beacons[bKey]
-	if !ok {
+func (c *Coordinator) releaseBeaconLocked(bKey string, b *targetBeacon, port int) {
+	if b == nil {
 		return
+	}
+	if pw := b.portWaiters[port]; pw <= 1 {
+		delete(b.portWaiters, port)
+	} else {
+		b.portWaiters[port] = pw - 1
 	}
 	b.waiters--
 	if b.waiters <= 0 {
-		delete(c.beacons, bKey)
+		if cur, ok := c.beacons[bKey]; ok && cur == b {
+			delete(c.beacons, bKey)
+		}
 		b.cancel()
 	}
 }
 
-func (c *Coordinator) runBeacon(ctx context.Context, targetName string, bcast netip.Addr, mac net.HardwareAddr, cooldown time.Duration) {
+func (c *Coordinator) runBeacon(
+	ctx context.Context,
+	targetName string,
+	bcast netip.Addr,
+	mac net.HardwareAddr,
+	cooldown time.Duration,
+	retryCh <-chan time.Duration,
+) {
 	if cooldown <= 0 {
 		cooldown = 10 * time.Second
 	}
@@ -204,19 +257,34 @@ func (c *Coordinator) runBeacon(ctx context.Context, targetName string, bcast ne
 		select {
 		case <-ctx.Done():
 			return
+		case nextCooldown := <-retryCh:
+			if ctx.Err() != nil {
+				return
+			}
+			if nextCooldown > 0 {
+				cooldown = nextCooldown
+			}
+			send(false)
+			ticker.Reset(cooldown)
+			select {
+			case <-ticker.C:
+			default:
+			}
 		case <-ticker.C:
 			send(false)
 		}
 	}
 }
 
-// HasActiveWake reports whether an in-flight wake/poll operation already exists for req.
+// HasActiveWake reports whether an in-flight wake cycle already exists for req's target.
 func (c *Coordinator) HasActiveWake(req WakeRequest) bool {
-	callKey := makeCallKey(req)
+	bKey := makeBeaconKey(req)
+	now := time.Now()
 	c.mu.Lock()
-	_, ok := c.calls[callKey]
+	b, ok := c.beacons[bKey]
+	active := ok && b.waiters > 0 && now.Before(b.deadline)
 	c.mu.Unlock()
-	return ok
+	return active
 }
 
 // WaitAndDial triggers (or joins) the in-flight wake operation for req.TargetName
@@ -238,29 +306,37 @@ func (c *Coordinator) WaitAndDial(ctx context.Context, req WakeRequest) (net.Con
 	bKey := makeBeaconKey(req)
 	callKey := makeCallKey(req)
 
+	now := time.Now()
 	c.mu.Lock()
-	c.acquireBeaconLocked(bKey, req)
+	beacon, rem := c.acquireBeaconLocked(bKey, req, now)
 	call, exists := c.calls[callKey]
+	if exists && ((isCallDone(call) && call.err != nil) || !now.Before(call.deadline)) {
+		delete(c.calls, callKey)
+		call.cancel()
+		exists = false
+	}
 	if exists {
 		call.waiters++
 	} else {
-		callCtx, cancel := context.WithTimeout(context.Background(), req.WakeTimeout)
+		pollTimeout := min(rem, req.WakeTimeout)
+		callCtx, cancel := context.WithTimeout(context.Background(), pollTimeout)
 		call = &portWakeCall{
 			done:      make(chan struct{}),
 			cancel:    cancel,
 			waiters:   1,
-			startedAt: time.Now(),
+			startedAt: now,
+			deadline:  now.Add(pollTimeout),
 		}
 		c.calls[callKey] = call
 		go c.runPortPoll(callCtx, callKey, call, req)
 	}
 	c.mu.Unlock()
 
-	joinedAt := time.Now()
+	joinedAt := now
 	defer func() {
 		var orphan net.Conn
 		c.mu.Lock()
-		c.releaseBeaconLocked(bKey)
+		c.releaseBeaconLocked(bKey, beacon, req.Port)
 		call.waiters--
 		if call.waiters <= 0 {
 			if current, ok := c.calls[callKey]; ok && current == call {
@@ -467,6 +543,45 @@ func WakeTargets(
 	return errors.Join(errs...)
 }
 
+func checkAnyPortOpen(ctx context.Context, dial DialFunc, ip netip.Addr, ports []int) bool {
+	if len(ports) == 0 {
+		return false
+	}
+	ipStr := ip.String()
+	if len(ports) == 1 {
+		dCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		conn, err := dial(dCtx, net.JoinHostPort(ipStr, strconv.Itoa(ports[0])))
+		if err == nil {
+			_ = conn.Close()
+			return true
+		}
+		return false
+	}
+
+	dCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+
+	var opened atomic.Bool
+	var wg sync.WaitGroup
+	for _, p := range ports {
+		p := p
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := dial(dCtx, net.JoinHostPort(ipStr, strconv.Itoa(p)))
+			if err == nil {
+				_ = conn.Close()
+				if opened.CompareAndSwap(false, true) {
+					cancel()
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return opened.Load()
+}
+
 func waitSingleTargetCLI(
 	ctx context.Context,
 	sender Sender,
@@ -478,16 +593,7 @@ func waitSingleTargetCLI(
 ) error {
 	checkAwake := func() bool {
 		if len(target.Ports) > 0 {
-			for _, p := range target.Ports {
-				dCtx, cancel := context.WithTimeout(ctx, time.Second)
-				conn, err := dial(dCtx, net.JoinHostPort(target.IP.String(), strconv.Itoa(p)))
-				cancel()
-				if err == nil {
-					_ = conn.Close()
-					return true
-				}
-			}
-			return false
+			return checkAnyPortOpen(ctx, dial, target.IP, target.Ports)
 		}
 		if arpProbe == nil {
 			return false

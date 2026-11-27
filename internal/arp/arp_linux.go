@@ -20,20 +20,29 @@ import (
 )
 
 const (
-	activeNeighborStates = unix.NUD_REACHABLE | unix.NUD_DELAY | unix.NUD_PROBE | unix.NUD_PERMANENT
-	arpFlagComplete      = 0x2 // ATF_COM in /proc/net/arp
+	activeNeighborStates    = unix.NUD_REACHABLE | unix.NUD_DELAY | unix.NUD_PROBE | unix.NUD_PERMANENT
+	confirmedNeighborStates = unix.NUD_REACHABLE | unix.NUD_PERMANENT
+	arpFlagComplete         = 0x2 // ATF_COM in /proc/net/arp
+
+	defaultNonRootProbeWait = 350 * time.Millisecond
+	defaultNonRootProbeStep = 50 * time.Millisecond
 )
 
 type rawARPQueryFunc func(ctx context.Context, lanIface netutil.InterfaceInfo, targets []netip.Addr, waitAfterSend time.Duration, stopOnFirst bool) (map[netip.Addr]string, error)
 type netlinkLookupFunc func(ifIndex int, targetIP netip.Addr) (state uint16, mac string, found bool, err error)
 type procARPLookupFunc func(ifaceName string, targetIP netip.Addr) string
+type udpTriggerFunc func(srcIP, targetIP netip.Addr) error
 
-// SystemChecker implements Checker on Linux using AF_PACKET raw ARP (when permitted)
-// and passive Netlink RTM_GETNEIGH / /proc/net/arp neighbor inspection otherwise.
+// SystemChecker implements Checker on Linux using AF_PACKET raw ARP (when permitted),
+// passive Netlink RTM_GETNEIGH inspection for background checks, and UDP-assisted
+// neighbor resolution for explicit non-root wake-wait probes.
 type SystemChecker struct {
 	rawQuery      rawARPQueryFunc
 	netlinkLookup netlinkLookupFunc
 	procLookup    procARPLookupFunc
+	udpTrigger    udpTriggerFunc
+	probeWait     time.Duration
+	probeStep     time.Duration
 }
 
 func NewSystemChecker() Checker {
@@ -61,8 +70,19 @@ func (c SystemChecker) doProcLookup(ifaceName string, targetIP netip.Addr) strin
 	return lookupProcARPMAC(ifaceName, targetIP)
 }
 
+func (c SystemChecker) doUDPTrigger(srcIP, targetIP netip.Addr) error {
+	if c.udpTrigger != nil {
+		return c.udpTrigger(srcIP, targetIP)
+	}
+	return triggerUDPNeighborProbe(srcIP, targetIP)
+}
+
 func isNeighborActive(state uint16) bool {
 	return state&activeNeighborStates != 0
+}
+
+func isNeighborConfirmed(state uint16) bool {
+	return state&confirmedNeighborStates != 0
 }
 
 func htons(v uint16) uint16 {
@@ -96,6 +116,105 @@ func (c SystemChecker) IsAwake(ctx context.Context, lanIface netutil.InterfaceIn
 		return false, nlErr
 	}
 	return ok && isNeighborActive(st), nil
+}
+
+// ProbeAwake actively checks whether ip is awake during an explicit wake-wait
+// (`wolproxy wake --wait` on profile-less targets or TUI `w` waking poll).
+// When root / CAP_NET_RAW is available, it uses raw AF_PACKET ARP request/reply.
+// When non-root, it first checks RTM_GETNEIGH for NUD_REACHABLE | NUD_PERMANENT;
+// otherwise it sends a unicast UDP packet (:9) from the matching LAN source IP to
+// trigger kernel ARP resolution and polls RTM_GETNEIGH briefly, accepting ONLY
+// NUD_REACHABLE | NUD_PERMANENT so NUD_STALE -> NUD_DELAY -> NUD_PROBE transitions
+// never misclassify a sleeping host as awake.
+func (c SystemChecker) ProbeAwake(ctx context.Context, lanIface netutil.InterfaceInfo, ip netip.Addr) (bool, error) {
+	if !ip.Is4() {
+		return false, errors.New("IPv4 주소만 지원합니다")
+	}
+	if !lanIface.ContainsIPv4(ip) {
+		return false, nil
+	}
+
+	found, err := c.doRawQuery(ctx, lanIface, []netip.Addr{ip}, 350*time.Millisecond, true)
+	if err == nil {
+		_, ok := found[ip]
+		return ok, nil
+	}
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+
+	st, _, ok, nlErr := c.doNetlinkLookup(lanIface.Index, ip)
+	if nlErr != nil {
+		return false, nlErr
+	}
+	if ok && isNeighborConfirmed(st) {
+		return true, nil
+	}
+
+	if srcIP, hasSrc := SelectSourceIP(lanIface, ip); hasSrc {
+		_ = c.doUDPTrigger(srcIP, ip)
+	}
+
+	waitDur := c.probeWait
+	if waitDur <= 0 {
+		waitDur = defaultNonRootProbeWait
+	}
+	stepDur := c.probeStep
+	if stepDur <= 0 {
+		stepDur = defaultNonRootProbeStep
+	}
+	if stepDur > waitDur {
+		stepDur = waitDur
+	}
+
+	deadline := time.Now().Add(waitDur)
+	timer := time.NewTimer(stepDur)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-timer.C:
+			st, _, ok, nlErr = c.doNetlinkLookup(lanIface.Index, ip)
+			if nlErr != nil {
+				return false, nlErr
+			}
+			if ok && isNeighborConfirmed(st) {
+				return true, nil
+			}
+			rem := time.Until(deadline)
+			if rem <= 0 {
+				return false, nil
+			}
+			nextStep := stepDur
+			if rem < nextStep {
+				nextStep = rem
+			}
+			timer.Reset(nextStep)
+		}
+	}
+}
+
+func triggerUDPNeighborProbe(srcIP, targetIP netip.Addr) error {
+	var localAddr *net.UDPAddr
+	if srcIP.IsValid() && srcIP.Is4() {
+		localAddr = &net.UDPAddr{
+			IP:   net.IP(srcIP.AsSlice()),
+			Port: 0,
+		}
+	}
+	remoteAddr := &net.UDPAddr{
+		IP:   net.IP(targetIP.AsSlice()),
+		Port: 9,
+	}
+	conn, err := net.DialUDP("udp4", localAddr, remoteAddr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_, err = conn.Write([]byte{0})
+	return err
 }
 
 func (c SystemChecker) LookupMAC(ctx context.Context, lanIface netutil.InterfaceInfo, ip netip.Addr) (string, string) {
