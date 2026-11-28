@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +17,9 @@ import (
 	"github.com/MoonSunMoor/wakeupProxy/internal/config"
 	"github.com/MoonSunMoor/wakeupProxy/internal/netutil"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/huh"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 type fakeService struct {
@@ -935,5 +939,519 @@ func TestTUIMultiSubnetWakeBroadcastSelection(t *testing.T) {
 		if gotSrc := <-srcCh; gotSrc != "127.0.2.10" {
 			t.Fatalf("expected TUI 't' to bind second subnet source 127.0.2.10, got %s", gotSrc)
 		}
+	}
+}
+
+var ansiEscapeRE = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+
+func stripANSI(s string) string {
+	return ansiEscapeRE.ReplaceAllString(s, "")
+}
+
+func displayCol(plainLine, token string) int {
+	idx := strings.Index(plainLine, token)
+	if idx < 0 {
+		return -1
+	}
+	return lipgloss.Width(plainLine[:idx])
+}
+
+func textAtDisplayCol(plainLine string, col int) string {
+	cur := 0
+	for byteIdx, r := range plainLine {
+		if cur == col {
+			return plainLine[byteIdx:]
+		}
+		cur += lipgloss.Width(string(r))
+		if cur > col {
+			break
+		}
+	}
+	return ""
+}
+
+func setTestColorProfile(t *testing.T, p termenv.Profile) {
+	t.Helper()
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(p)
+	t.Cleanup(func() {
+		lipgloss.SetColorProfile(prev)
+	})
+}
+
+func findLineContaining(rendered, needle string) string {
+	for _, line := range strings.Split(rendered, "\n") {
+		if strings.Contains(stripANSI(line), needle) {
+			return line
+		}
+	}
+	return ""
+}
+
+func assertNoForbiddenColorSymbols(t *testing.T, label, rendered string) {
+	t.Helper()
+	plain := stripANSI(rendered)
+	for _, sym := range []string{"←", "[선택됨]", ">", "✓", "•"} {
+		if strings.Contains(plain, sym) {
+			t.Fatalf("%s in color mode must not contain %q, got:\n%s", label, sym, plain)
+		}
+	}
+}
+
+func TestColorModeTablesZeroColumnAlignmentAndRowHighlightWidth(t *testing.T) {
+	setTestColorProfile(t, termenv.ANSI256)
+
+	m, _, _, _, _ := setupTestModel(t, true)
+	m.cfg.Targets = append(m.cfg.Targets, config.Target{
+		Name:     "pc2",
+		IP:       "192.168.0.55",
+		MAC:      "aa:bb:cc:dd:ee:55",
+		Profiles: []string{"rdp"},
+		Allow:    []string{"laptop"},
+		Note:     "거실 데스크톱",
+	})
+	cl := m.cfg.Clients["unused"]
+	cl.Note = "예비 클라이언트"
+	m.cfg.Clients["unused"] = cl
+
+	pr := m.cfg.Profiles["unused-prof"]
+	pr.Note = "테스트용 포트"
+	m.cfg.Profiles["unused-prof"] = pr
+
+	// 1. Targets table: 0-column alignment, empty-note padding to header width, longer note preserved
+	targetsOut := m.renderTargetsList()
+	assertNoForbiddenColorSymbols(t, "targets list", targetsOut)
+	tLines := strings.Split(strings.TrimSuffix(targetsOut, "\n"), "\n")
+	if len(tLines) < 4 {
+		t.Fatalf("expected header + border + 2 target rows, got %d lines:\n%s", len(tLines), targetsOut)
+	}
+	tHdr := stripANSI(tLines[0])
+	tRow0 := stripANSI(tLines[2]) // pc1 (empty note, cursor=0)
+	tRow1 := stripANSI(tLines[3]) // pc2 (non-empty note)
+
+	if got := displayCol(tHdr, "이름"); got != 0 {
+		t.Fatalf("expected targets header at col 0, got %d (%q)", got, tHdr)
+	}
+	for _, pair := range [][2]string{
+		{"이름", "pc1"},
+		{"IP (별칭)", "192.168.0.21"},
+		{"프로파일", "rdp"},
+		{"상태", "확인 전"},
+	} {
+		if displayCol(tHdr, pair[0]) != displayCol(tRow0, pair[1]) {
+			t.Fatalf("targets column mismatch for %q vs %q: hdr=%d row=%d\nhdr: %q\nrow: %q",
+				pair[0], pair[1], displayCol(tHdr, pair[0]), displayCol(tRow0, pair[1]), tHdr, tRow0)
+		}
+	}
+	if displayCol(tHdr, "note") != displayCol(tRow1, "거실 데스크톱") {
+		t.Fatalf("targets note col mismatch: hdr=%d row1=%d", displayCol(tHdr, "note"), displayCol(tRow1, "거실 데스크톱"))
+	}
+	if lipgloss.Width(tRow0) != lipgloss.Width(tHdr) {
+		t.Fatalf("expected empty-note target row width (%d) to equal header width (%d)", lipgloss.Width(tRow0), lipgloss.Width(tHdr))
+	}
+	if lipgloss.Width(tRow1) <= lipgloss.Width(tHdr) {
+		t.Fatalf("expected longer target row width (%d) to exceed header width (%d)", lipgloss.Width(tRow1), lipgloss.Width(tHdr))
+	}
+	if !strings.Contains(tLines[2], "48;5;237") || !strings.Contains(tLines[2], "38;5;255") {
+		t.Fatalf("expected cursor target row styled with bg 237 + fg 255, got %q", tLines[2])
+	}
+	if strings.Contains(tLines[3], "48;5;237") {
+		t.Fatalf("expected non-cursor target row not to have bg 237, got %q", tLines[3])
+	}
+
+	// 2. Clients table
+	clientsOut := m.renderClientsList()
+	assertNoForbiddenColorSymbols(t, "clients list", clientsOut)
+	cLines := strings.Split(strings.TrimSuffix(clientsOut, "\n"), "\n")
+	cHdr := stripANSI(cLines[0])
+	cRow0 := stripANSI(cLines[2]) // laptop (empty note, referenced by pc1 + pc2 = 2)
+	cRow1 := stripANSI(cLines[3]) // unused (with note, referenced by 0)
+	for _, pair := range [][2]string{
+		{"이름", "laptop"},
+		{"IP/CIDR", "10.66.0.2/32"},
+		{"참조 타깃 수", "2 "},
+	} {
+		col := displayCol(cHdr, pair[0])
+		if !strings.HasPrefix(textAtDisplayCol(cRow0, col), pair[1]) {
+			t.Fatalf("clients column mismatch for %q at col %d: got %q in row %q", pair[0], col, textAtDisplayCol(cRow0, col), cRow0)
+		}
+	}
+	if displayCol(cHdr, "note") != displayCol(cRow1, "예비 클라이언트") {
+		t.Fatalf("clients note col mismatch: hdr=%d row1=%d", displayCol(cHdr, "note"), displayCol(cRow1, "예비 클라이언트"))
+	}
+	if lipgloss.Width(cRow0) != lipgloss.Width(cHdr) {
+		t.Fatalf("expected empty-note client row width (%d) == header width (%d)", lipgloss.Width(cRow0), lipgloss.Width(cHdr))
+	}
+
+	// 3. Profiles table
+	profilesOut := m.renderProfilesList()
+	assertNoForbiddenColorSymbols(t, "profiles list", profilesOut)
+	pLines := strings.Split(strings.TrimSuffix(profilesOut, "\n"), "\n")
+	pHdr := stripANSI(pLines[0])
+	pRow0 := stripANSI(pLines[2]) // rdp (empty note, referenced by pc1 + pc2 = 2)
+	pRow1 := stripANSI(pLines[3]) // unused-prof (with note, referenced by 0)
+	for _, pair := range [][2]string{
+		{"이름", "rdp"},
+		{"포트", "3389"},
+		{"wake", "auto"},
+		{"idle_timeout", "0 "},
+		{"참조 타깃 수", "2 "},
+	} {
+		col := displayCol(pHdr, pair[0])
+		if !strings.HasPrefix(textAtDisplayCol(pRow0, col), pair[1]) {
+			t.Fatalf("profiles column mismatch for %q at col %d: got %q in row %q", pair[0], col, textAtDisplayCol(pRow0, col), pRow0)
+		}
+	}
+	if displayCol(pHdr, "note") != displayCol(pRow1, "테스트용 포트") {
+		t.Fatalf("profiles note col mismatch: hdr=%d row1=%d", displayCol(pHdr, "note"), displayCol(pRow1, "테스트용 포트"))
+	}
+	if lipgloss.Width(pRow0) != lipgloss.Width(pHdr) {
+		t.Fatalf("expected empty-note profile row width (%d) == header width (%d)", lipgloss.Width(pRow0), lipgloss.Width(pHdr))
+	}
+
+	// 4. LAN Scan modal: header and rows share exact column offsets; unregistered row pads to header width
+	m.scanResults = []arp.DiscoveredHost{
+		{IP: netip.MustParseAddr("192.168.0.21"), MAC: "aa:bb:cc:dd:ee:01", Hostname: "pc1.lan"},
+		{IP: netip.MustParseAddr("192.168.0.99"), MAC: "aa:bb:cc:dd:ee:99", Hostname: "guest.lan"},
+	}
+	m.modalCursor = 1 // select unregistered host (empty registration column)
+	lanOut := m.renderLANScanModal()
+	assertNoForbiddenColorSymbols(t, "LAN scan modal", lanOut)
+	lanHdr := stripANSI(findLineContaining(lanOut, "호스트 이름"))
+	lanRow0 := stripANSI(findLineContaining(lanOut, "192.168.0.21"))
+	lanRow1Raw := findLineContaining(lanOut, "192.168.0.99")
+	lanRow1 := stripANSI(lanRow1Raw)
+	for _, pair := range [][2]string{
+		{"IP", "192.168.0.21"},
+		{"MAC", "aa:bb:cc:dd:ee:01"},
+		{"호스트 이름", "pc1.lan"},
+		{"등록 여부", "[등록됨: pc1]"},
+	} {
+		if displayCol(lanHdr, pair[0]) != displayCol(lanRow0, pair[1]) {
+			t.Fatalf("LAN scan col mismatch for %q vs %q: hdr=%d row0=%d\nhdr: %q\nrow0: %q",
+				pair[0], pair[1], displayCol(lanHdr, pair[0]), displayCol(lanRow0, pair[1]), lanHdr, lanRow0)
+		}
+	}
+	if displayCol(lanHdr, "IP") != displayCol(lanRow1, "192.168.0.99") {
+		t.Fatalf("LAN scan unregistered row IP col mismatch: hdr=%d row1=%d", displayCol(lanHdr, "IP"), displayCol(lanRow1, "192.168.0.99"))
+	}
+	// Verify highlighted span on unregistered row covers full header width (71 cols)
+	wantHdrW := lipgloss.Width(formatCell("IP", 18) + formatCell("MAC", 20) + formatCell("호스트 이름", 24) + "등록 여부")
+	expectedSpan := selectedRowStyle.Render(padRight(
+		formatCell("192.168.0.99", 18)+formatCell("aa:bb:cc:dd:ee:99", 20)+formatCell("guest.lan", 24),
+		wantHdrW,
+	))
+	if !strings.Contains(lanRow1Raw, expectedSpan) {
+		t.Fatalf("expected unregistered LAN scan row highlight bar padded to header width (%d), got:\n%q", wantHdrW, lanRow1Raw)
+	}
+
+	// 5. Preset Picker & Validation Errors modal: constant highlight bar width across cursor moves
+	m.modalCursor = 0
+	preset0 := m.renderPresetPicker()
+	m.modalCursor = 2 // "빈 프로파일 (직접 입력)"
+	preset2 := m.renderPresetPicker()
+	assertNoForbiddenColorSymbols(t, "preset picker", preset0)
+	assertNoForbiddenColorSymbols(t, "preset picker", preset2)
+
+	m.valErrors = config.ValidationErrorList{
+		{Section: config.SectionGlobal, Message: "짧은 오류"},
+		{Section: config.SectionTarget, ItemName: "pc1", Message: "훨씬 더 긴 검증 오류 메시지입니다"},
+	}
+	m.modalCursor = 0
+	valOut0 := m.renderValidationErrorsModal()
+	assertNoForbiddenColorSymbols(t, "validation errors modal", valOut0)
+	maxErrW := lipgloss.Width(m.valErrors[1].Error())
+	wantValSpan0 := selectedRowStyle.Render(padRight(m.valErrors[0].Error(), maxErrW))
+	if !strings.Contains(valOut0, wantValSpan0) {
+		t.Fatalf("expected short validation error row padded to max item width (%d), got:\n%q", maxErrW, valOut0)
+	}
+}
+
+func TestColorModeFormsInputPromptFocusBlurAndSelectStates(t *testing.T) {
+	setTestColorProfile(t, termenv.ANSI256)
+
+	m, _, _, _, _ := setupTestModel(t, true)
+	// Add a 3rd profile so MultiSelect can show all states simultaneously
+	m.cfg.Profiles["ssh"] = config.Profile{Port: 22, Wake: config.WakeAuto}
+	// Sorted profile keys: ["rdp", "ssh", "unused-prof"]; select "ssh" (index 1) on pc1
+	m.cfg.Targets[0].Profiles = []string{"ssh"}
+
+	// Open Target Form on pc1 (initial focus is on "name" Input)
+	m = sendFormKey(m, "enter")
+	if m.screen != screenTargetForm {
+		t.Fatalf("expected screenTargetForm, got %v", m.screen)
+	}
+	if !isTextInputFocused(m.form) || focusedFieldKey(m.form) != "name" {
+		t.Fatalf("expected initial focus on unwrapped *huh.Input 'name', got key=%q isInput=%v", focusedFieldKey(m.form), isTextInputFocused(m.form))
+	}
+
+	initialFormView := m.form.View()
+	assertNoForbiddenColorSymbols(t, "target form initial", initialFormView)
+
+	// Focused field ("name") has left border in color 62; empty "note" input shows placeholder without "> "
+	nameTitleLine := findLineContaining(initialFormView, "타깃 이름")
+	if !strings.Contains(nameTitleLine, "38;5;62m") {
+		t.Fatalf("expected focused field left border to use color 62, got %q", nameTitleLine)
+	}
+	if !strings.Contains(stripANSI(initialFormView), "optional") {
+		t.Fatalf("expected empty note input to render placeholder 'optional', got:\n%s", stripANSI(initialFormView))
+	}
+
+	// While "name" is focused, MultiSelect "profiles" is blurred: no cursor bg (237), "ssh" is green bold (78)
+	sshBlurredLine := findLineContaining(initialFormView, "ssh (port 22")
+	rdpBlurredLine := findLineContaining(initialFormView, "rdp (port 3389")
+	if strings.Contains(sshBlurredLine, "48;5;237") || strings.Contains(rdpBlurredLine, "48;5;237") {
+		t.Fatalf("expected blurred MultiSelect not to render cursor bg 237:\nssh=%q\nrdp=%q", sshBlurredLine, rdpBlurredLine)
+	}
+	if !strings.Contains(sshBlurredLine, "1;38;5;78m") {
+		t.Fatalf("expected blurred MultiSelect selected option 'ssh' to keep bold green 78, got %q", sshBlurredLine)
+	}
+
+	// Tab to MultiSelect "profiles" (name -> ip -> mac -> alias -> profiles)
+	for i := 0; i < 4; i++ {
+		m = sendFormKey(m, "tab")
+	}
+	if focusedFieldKey(m.form) != "profiles" || isTextInputFocused(m.form) {
+		t.Fatalf("expected focus on MultiSelect 'profiles' (not text input), got key=%q", focusedFieldKey(m.form))
+	}
+
+	// Cursor starts at index 0 ("rdp"):
+	// - "rdp": unselected + cursor -> bg 237 + bold white 255
+	// - "ssh": selected + non-cursor -> no bg + bold green 78
+	// - "unused-prof": unselected + non-cursor -> no bg + text 252
+	profFocusView0 := m.form.View()
+	assertNoForbiddenColorSymbols(t, "target form profiles cursor 0", profFocusView0)
+	rdpLine0 := findLineContaining(profFocusView0, "rdp (port 3389")
+	sshLine0 := findLineContaining(profFocusView0, "ssh (port 22")
+	unusedLine0 := findLineContaining(profFocusView0, "unused-prof (port 8080")
+	if !strings.Contains(rdpLine0, "1;38;5;255;48;5;237m") {
+		t.Fatalf("expected unselected+cursor 'rdp' to have bold white 255 + bg 237, got %q", rdpLine0)
+	}
+	if !strings.Contains(sshLine0, "1;38;5;78m") || strings.Contains(sshLine0, "48;5;237") {
+		t.Fatalf("expected selected+non-cursor 'ssh' to have bold green 78 without bg 237, got %q", sshLine0)
+	}
+	if !strings.Contains(unusedLine0, "38;5;252m") || strings.Contains(unusedLine0, "48;5;237") {
+		t.Fatalf("expected unselected+non-cursor 'unused-prof' to have fg 252 without bg 237, got %q", unusedLine0)
+	}
+
+	// Move cursor down ('j') onto "ssh" -> simultaneous SELECTED + CURSOR state (bg 237 + bold green 78)!
+	m = sendFormKey(m, "j")
+	profFocusView1 := m.form.View()
+	rdpLine1 := findLineContaining(profFocusView1, "rdp (port 3389")
+	sshLine1 := findLineContaining(profFocusView1, "ssh (port 22")
+	if strings.Contains(rdpLine1, "48;5;237") {
+		t.Fatalf("expected 'rdp' to lose cursor bg after moving down, got %q", rdpLine1)
+	}
+	if !strings.Contains(sshLine1, "1;38;5;78;48;5;237m") {
+		t.Fatalf("expected selected+cursor 'ssh' to have bold green 78 + bg 237, got %q", sshLine1)
+	}
+
+	// Tab to "allow" -> "profiles" blurs: cursor bg disappears from "ssh", bold green 78 remains!
+	m = sendFormKey(m, "tab")
+	if focusedFieldKey(m.form) != "allow" {
+		t.Fatalf("expected focus on 'allow', got %q", focusedFieldKey(m.form))
+	}
+	afterBlurView := m.form.View()
+	sshAfterBlur := findLineContaining(afterBlurView, "ssh (port 22")
+	if strings.Contains(sshAfterBlur, "48;5;237") || !strings.Contains(sshAfterBlur, "1;38;5;78m") {
+		t.Fatalf("expected blurred 'ssh' to drop bg 237 and retain bold green 78, got %q", sshAfterBlur)
+	}
+
+	// Verify Select field ("lan_interface" in Global Form): Focused vs Blurred states
+	m = sendFormKey(m, "esc")
+	m = sendFormKey(m, "4")
+	m = sendFormKey(m, "enter")
+	if m.screen != screenGlobalForm || focusedFieldKey(m.form) != "lan_interface" {
+		t.Fatalf("expected screenGlobalForm focused on 'lan_interface', got screen=%v key=%q", m.screen, focusedFieldKey(m.form))
+	}
+	globalFocused := m.form.View()
+	assertNoForbiddenColorSymbols(t, "global form focused select", globalFocused)
+	// First 2 option lines belong to lan_interface Select (eth0 selected, wg0 unselected)
+	gLinesFocused := strings.Split(globalFocused, "\n")
+	var lanEthFocused, lanWgFocused string
+	for _, ln := range gLinesFocused {
+		plain := stripANSI(ln)
+		if lanEthFocused == "" && strings.Contains(plain, "eth0 (") {
+			lanEthFocused = ln
+		} else if lanEthFocused != "" && lanWgFocused == "" && strings.Contains(plain, "wg0 (") {
+			lanWgFocused = ln
+			break
+		}
+	}
+	if !strings.Contains(lanEthFocused, "1;38;5;78;48;5;237m") {
+		t.Fatalf("expected focused Select selected option 'eth0' to have bold green 78 + bg 237, got %q", lanEthFocused)
+	}
+	if !strings.Contains(lanWgFocused, "38;5;252m") || strings.Contains(lanWgFocused, "48;5;237") {
+		t.Fatalf("expected focused Select unselected option 'wg0' to have fg 252 without bg 237, got %q", lanWgFocused)
+	}
+
+	// Tab to blur lan_interface Select -> eth0 keeps bold green 78 without bg 237, wg0 dims to 244
+	m = sendFormKey(m, "tab")
+	globalBlurred := m.form.View()
+	var lanEthBlurred, lanWgBlurred string
+	for _, ln := range strings.Split(globalBlurred, "\n") {
+		plain := stripANSI(ln)
+		if lanEthBlurred == "" && strings.Contains(plain, "eth0 (") {
+			lanEthBlurred = ln
+		} else if lanEthBlurred != "" && lanWgBlurred == "" && strings.Contains(plain, "wg0 (") {
+			lanWgBlurred = ln
+			break
+		}
+	}
+	if strings.Contains(lanEthBlurred, "48;5;237") || !strings.Contains(lanEthBlurred, "1;38;5;78m") {
+		t.Fatalf("expected blurred Select selected option 'eth0' to drop bg 237 and keep bold green 78, got %q", lanEthBlurred)
+	}
+	if strings.Contains(lanWgBlurred, "48;5;237") || !strings.Contains(lanWgBlurred, "38;5;244m") {
+		t.Fatalf("expected blurred Select unselected option 'wg0' to render muted 244 without bg 237, got %q", lanWgBlurred)
+	}
+
+	// Verify viewport scrolling on selectField / multiSelectField when Height constrains visible rows
+	opts := []huh.Option[string]{
+		huh.NewOption("opt-1", "v1"),
+		huh.NewOption("opt-2", "v2"),
+		huh.NewOption("opt-3", "v3"),
+		huh.NewOption("opt-4", "v4"),
+	}
+	selVal := "v1"
+	sf := newSelectField("scroll_sel", "스크롤 선택", opts, &selVal).Height(3) // 1 title + 2 visible options
+	_ = sf.Focus()
+	v0 := stripANSI(sf.View())
+	if !strings.Contains(v0, "opt-1") || !strings.Contains(v0, "opt-2") || strings.Contains(v0, "opt-3") {
+		t.Fatalf("expected initial scrolled select viewport to show opt-1..opt-2 only, got:\n%s", v0)
+	}
+	_, _ = sf.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	_, _ = sf.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")}) // cursor -> opt-3
+	v2 := stripANSI(sf.View())
+	if strings.Contains(v2, "opt-1") || !strings.Contains(v2, "opt-2") || !strings.Contains(v2, "opt-3") {
+		t.Fatalf("expected scrolled select viewport after moving to opt-3 to show opt-2..opt-3, got:\n%s", v2)
+	}
+
+	var multiVals []string
+	mf := newMultiSelectField("scroll_multi", "스크롤 다중선택", opts, &multiVals).
+		Height(3).
+		Validate(func(sel []string) error {
+			if len(sel) == 0 {
+				return errors.New("최소 1개 선택")
+			}
+			return nil
+		})
+	_ = mf.Focus()
+	_, _ = mf.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	_, _ = mf.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	_, _ = mf.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")}) // cursor -> opt-4
+	mv3 := stripANSI(mf.View())
+	if strings.Contains(mv3, "opt-1") || strings.Contains(mv3, "opt-2") || !strings.Contains(mv3, "opt-3") || !strings.Contains(mv3, "opt-4") {
+		t.Fatalf("expected scrolled multiselect viewport at opt-4 to show opt-3..opt-4, got:\n%s", mv3)
+	}
+	_, _ = mf.Update(tea.KeyMsg{Type: tea.KeyEnter}) // triggers validation error on empty selection
+	if mf.Error() == nil || !strings.Contains(stripANSI(mf.View()), "스크롤 다중선택 *") {
+		t.Fatalf("expected validation error indicator on multiselect title, err=%v view:\n%s", mf.Error(), stripANSI(mf.View()))
+	}
+
+	// Verify 16-color ANSI profile also uses color without ASCII suffixes
+	setTestColorProfile(t, termenv.ANSI)
+	assertNoForbiddenColorSymbols(t, "targets list ANSI16", m.renderTargetsList())
+}
+
+func TestASCIIModePreservesZeroColAlignmentAndAppendsRightSuffixes(t *testing.T) {
+	setTestColorProfile(t, termenv.Ascii)
+
+	m, _, _, _, _ := setupTestModel(t, true)
+	m.cfg.Profiles["ssh"] = config.Profile{Port: 22, Wake: config.WakeAuto}
+	m.cfg.Targets = append(m.cfg.Targets, config.Target{
+		Name:     "pc2",
+		IP:       "192.168.0.55",
+		MAC:      "aa:bb:cc:dd:ee:55",
+		Profiles: []string{"rdp"},
+		Allow:    []string{"laptop"},
+	})
+	m.cfg.Targets[0].Profiles = []string{"ssh"}
+
+	// 1. Targets table in Ascii mode: 0-column aligned, right-end " ←" only on cursor row
+	targetsOut := m.renderTargetsList()
+	tLines := strings.Split(strings.TrimSuffix(targetsOut, "\n"), "\n")
+	tHdr := tLines[0]
+	tRow0 := tLines[2]
+	tRow1 := tLines[3]
+	if displayCol(tHdr, "이름") != 0 || displayCol(tRow0, "pc1") != 0 || displayCol(tRow1, "pc2") != 0 {
+		t.Fatalf("expected 0-column alignment preserved in Ascii mode:\nhdr=%q\nrow0=%q\nrow1=%q", tHdr, tRow0, tRow1)
+	}
+	if displayCol(tHdr, "IP (별칭)") != displayCol(tRow0, "192.168.0.21") {
+		t.Fatalf("expected IP column offset preserved in Ascii mode: hdr=%d row0=%d", displayCol(tHdr, "IP (별칭)"), displayCol(tRow0, "192.168.0.21"))
+	}
+	if !strings.HasSuffix(tRow0, " ←") || strings.Contains(tRow1, " ←") {
+		t.Fatalf("expected only cursor row 0 to end with ' ←' in Ascii mode:\nrow0=%q\nrow1=%q", tRow0, tRow1)
+	}
+
+	// Move cursor down -> " ←" moves to row 1
+	m, _ = sendKey(m, "j")
+	tLinesMoved := strings.Split(strings.TrimSuffix(m.renderTargetsList(), "\n"), "\n")
+	if strings.Contains(tLinesMoved[2], " ←") || !strings.HasSuffix(tLinesMoved[3], " ←") {
+		t.Fatalf("expected ' ←' to move to row 1 after 'j':\nrow0=%q\nrow1=%q", tLinesMoved[2], tLinesMoved[3])
+	}
+	m.targetCursor = 0
+
+	// 2. Target Form MultiSelect in Ascii mode: 4 states + Blur behavior
+	m = sendFormKey(m, "enter")
+	for i := 0; i < 4; i++ {
+		m = sendFormKey(m, "tab") // focus "profiles"
+	}
+	// Cursor on "rdp" (unselected), "ssh" is selected (non-cursor), "unused-prof" is unselected (non-cursor)
+	asciiForm0 := m.form.View()
+	rdp0 := strings.TrimRight(findLineContaining(asciiForm0, "rdp (port 3389"), " ")
+	ssh0 := strings.TrimRight(findLineContaining(asciiForm0, "ssh (port 22"), " ")
+	unused0 := strings.TrimRight(findLineContaining(asciiForm0, "unused-prof (port 8080"), " ")
+	if !strings.HasSuffix(rdp0, "rdp (port 3389, wake=auto) ←") {
+		t.Fatalf("expected focused unselected cursor option to end with ' ←', got %q", rdp0)
+	}
+	if !strings.HasSuffix(ssh0, "ssh (port 22, wake=auto) [선택됨]") {
+		t.Fatalf("expected selected non-cursor option to end with ' [선택됨]', got %q", ssh0)
+	}
+	if strings.Contains(unused0, "←") || strings.Contains(unused0, "[선택됨]") {
+		t.Fatalf("expected unselected non-cursor option to have no suffix, got %q", unused0)
+	}
+
+	// Move cursor onto "ssh" -> ends with " [선택됨] ←"
+	m = sendFormKey(m, "j")
+	asciiForm1 := m.form.View()
+	ssh1 := strings.TrimRight(findLineContaining(asciiForm1, "ssh (port 22"), " ")
+	if !strings.HasSuffix(ssh1, "ssh (port 22, wake=auto) [선택됨] ←") {
+		t.Fatalf("expected selected+cursor option in Ascii mode to end with ' [선택됨] ←', got %q", ssh1)
+	}
+
+	// Blur "profiles" via Tab -> " ←" disappears from "profiles", " [선택됨]" stays!
+	m = sendFormKey(m, "tab")
+	asciiFormBlurred := m.form.View()
+	sshBlurred := strings.TrimRight(findLineContaining(asciiFormBlurred, "ssh (port 22"), " ")
+	if !strings.HasSuffix(sshBlurred, "ssh (port 22, wake=auto) [선택됨]") || strings.Contains(sshBlurred, "←") {
+		t.Fatalf("expected blurred MultiSelect option to keep ' [선택됨]' without ' ←', got %q", sshBlurred)
+	}
+
+	// 3. Global Form Select in Ascii mode: Focused (" [선택됨] ←") vs Blurred (" [선택됨]")
+	m = sendFormKey(m, "esc")
+	m = sendFormKey(m, "4")
+	m = sendFormKey(m, "enter")
+	gAsciiFocused := m.form.View()
+	firstEthFocused := ""
+	for _, ln := range strings.Split(gAsciiFocused, "\n") {
+		if strings.Contains(ln, "eth0 (") {
+			firstEthFocused = strings.TrimRight(ln, " ")
+			break
+		}
+	}
+	if !strings.HasSuffix(firstEthFocused, " [선택됨] ←") {
+		t.Fatalf("expected focused Select option in Ascii mode to end with ' [선택됨] ←', got %q", firstEthFocused)
+	}
+	m = sendFormKey(m, "tab")
+	gAsciiBlurred := m.form.View()
+	firstEthBlurred := ""
+	for _, ln := range strings.Split(gAsciiBlurred, "\n") {
+		if strings.Contains(ln, "eth0 (") {
+			firstEthBlurred = strings.TrimRight(ln, " ")
+			break
+		}
+	}
+	if !strings.HasSuffix(firstEthBlurred, " [선택됨]") || strings.Contains(firstEthBlurred, "←") {
+		t.Fatalf("expected blurred Select option in Ascii mode to keep ' [선택됨]' without ' ←', got %q", firstEthBlurred)
 	}
 }
