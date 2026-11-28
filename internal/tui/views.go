@@ -6,6 +6,7 @@ import (
 
 	"github.com/MoonSunMoor/wakeupProxy/internal/config"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 var (
@@ -47,8 +48,19 @@ var (
 
 	selectedRowStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.Color("229")).
+				Foreground(lipgloss.Color("255")).
 				Background(lipgloss.Color("237"))
+
+	selectedOptionCursorStyle = lipgloss.NewStyle().
+					Bold(true).
+					Foreground(lipgloss.Color("78")).
+					Background(lipgloss.Color("237"))
+
+	normalOptionStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("252"))
+
+	blurredUnselectedSelectStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("244"))
 
 	boxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
@@ -76,12 +88,27 @@ var (
 			Padding(0, 1)
 )
 
+func isASCIIProfile() bool {
+	return lipgloss.ColorProfile() == termenv.Ascii
+}
+
 func padRight(s string, width int) string {
 	w := lipgloss.Width(s)
 	if w >= width {
 		return s
 	}
 	return s + strings.Repeat(" ", width-w)
+}
+
+func renderSelectableRow(row string, minWidth int, selected bool) string {
+	padded := padRight(row, minWidth)
+	if !selected {
+		return padded
+	}
+	if isASCIIProfile() {
+		return padded + " ←"
+	}
+	return selectedRowStyle.Render(padded)
 }
 
 func truncateDisplay(s string, maxWidth int) string {
@@ -138,11 +165,12 @@ func (m *Model) renderTargetsList() string {
 		formatCell("프로파일", 20) +
 		formatCell("상태", 14) +
 		"note"
+	hdrWidth := lipgloss.Width(hdr)
 	b.WriteString(headerRowStyle.Render(hdr))
 	b.WriteByte('\n')
 
 	if len(m.cfg.Targets) == 0 {
-		b.WriteString(mutedStyle.Render("  등록된 타깃이 없습니다. 'a'를 눌러 타깃을 추가하세요."))
+		b.WriteString(mutedStyle.Render("등록된 타깃이 없습니다. 'a'를 눌러 타깃을 추가하세요."))
 		return b.String()
 	}
 
@@ -161,11 +189,7 @@ func (m *Model) renderTargetsList() string {
 			formatCell(profCol, 20) +
 			formatCell(stText, 14) +
 			truncateDisplay(t.Note, 30)
-		if i == m.targetCursor {
-			b.WriteString(selectedRowStyle.Render("> " + row))
-		} else {
-			b.WriteString("  " + row)
-		}
+		b.WriteString(renderSelectableRow(row, hdrWidth, i == m.targetCursor))
 		b.WriteByte('\n')
 	}
 	return b.String()
@@ -194,12 +218,13 @@ func (m *Model) renderClientsList() string {
 		formatCell("IP/CIDR", 22) +
 		formatCell("참조 타깃 수", 14) +
 		"note"
+	hdrWidth := lipgloss.Width(hdr)
 	b.WriteString(headerRowStyle.Render(hdr))
 	b.WriteByte('\n')
 
 	names := config.SortedKeys(m.cfg.Clients)
 	if len(names) == 0 {
-		b.WriteString(mutedStyle.Render("  등록된 클라이언트가 없습니다. 'a'를 눌러 추가하세요."))
+		b.WriteString(mutedStyle.Render("등록된 클라이언트가 없습니다. 'a'를 눌러 추가하세요."))
 		return b.String()
 	}
 
@@ -210,11 +235,7 @@ func (m *Model) renderClientsList() string {
 			formatCell(cl.CIDR, 22) +
 			formatCell(fmt.Sprintf("%d", refCount), 14) +
 			truncateDisplay(cl.Note, 36)
-		if i == m.clientCursor {
-			b.WriteString(selectedRowStyle.Render("> " + row))
-		} else {
-			b.WriteString("  " + row)
-		}
+		b.WriteString(renderSelectableRow(row, hdrWidth, i == m.clientCursor))
 		b.WriteByte('\n')
 	}
 	return b.String()
@@ -228,12 +249,13 @@ func (m *Model) renderProfilesList() string {
 		formatCell("idle_timeout", 14) +
 		formatCell("참조 타깃 수", 14) +
 		"note"
+	hdrWidth := lipgloss.Width(hdr)
 	b.WriteString(headerRowStyle.Render(hdr))
 	b.WriteByte('\n')
 
 	names := config.SortedKeys(m.cfg.Profiles)
 	if len(names) == 0 {
-		b.WriteString(mutedStyle.Render("  등록된 프로파일이 없습니다. 'a'를 눌러 추가하세요."))
+		b.WriteString(mutedStyle.Render("등록된 프로파일이 없습니다. 'a'를 눌러 추가하세요."))
 		return b.String()
 	}
 
@@ -254,11 +276,7 @@ func (m *Model) renderProfilesList() string {
 			formatCell(idleStr, 14) +
 			formatCell(fmt.Sprintf("%d", refCount), 14) +
 			truncateDisplay(pr.Note, 30)
-		if i == m.profileCursor {
-			b.WriteString(selectedRowStyle.Render("> " + row))
-		} else {
-			b.WriteString("  " + row)
-		}
+		b.WriteString(renderSelectableRow(row, hdrWidth, i == m.profileCursor))
 		b.WriteByte('\n')
 	}
 	return b.String()
@@ -295,12 +313,14 @@ func (m *Model) renderPresetPicker() string {
 	b.WriteString(headerRowStyle.Render("프로파일 프리셋 선택"))
 	b.WriteString("\n\n")
 	items := m.presetChoices()
-	for i, item := range items {
-		if i == m.modalCursor {
-			b.WriteString(selectedRowStyle.Render("> " + item.label))
-		} else {
-			b.WriteString("  " + item.label)
+	maxW := 0
+	for _, item := range items {
+		if w := lipgloss.Width(item.label); w > maxW {
+			maxW = w
 		}
+	}
+	for i, item := range items {
+		b.WriteString(renderSelectableRow(item.label, maxW, i == m.modalCursor))
 		b.WriteByte('\n')
 	}
 	return boxStyle.Render(b.String())
@@ -328,7 +348,8 @@ func (m *Model) renderLANScanModal() string {
 	}
 
 	hdr := formatCell("IP", 18) + formatCell("MAC", 20) + formatCell("호스트 이름", 24) + "등록 여부"
-	b.WriteString(mutedStyle.Render("  " + hdr))
+	hdrWidth := lipgloss.Width(hdr)
+	b.WriteString(mutedStyle.Render(hdr))
 	b.WriteByte('\n')
 
 	for i, h := range m.scanResults {
@@ -346,11 +367,7 @@ func (m *Model) renderLANScanModal() string {
 			formatCell(h.MAC, 20) +
 			formatCell(host, 24) +
 			reg
-		if i == m.modalCursor {
-			b.WriteString(selectedRowStyle.Render("> " + row))
-		} else {
-			b.WriteString("  " + row)
-		}
+		b.WriteString(renderSelectableRow(row, hdrWidth, i == m.modalCursor))
 		b.WriteByte('\n')
 	}
 	return boxStyle.Render(b.String())
@@ -360,13 +377,16 @@ func (m *Model) renderValidationErrorsModal() string {
 	var b strings.Builder
 	b.WriteString(errStyle.Render(fmt.Sprintf("설정 검증 오류 (%d건) - 항목을 선택하면 해당 편집 폼으로 이동합니다", len(m.valErrors))))
 	b.WriteString("\n\n")
+	lines := make([]string, len(m.valErrors))
+	maxW := 0
 	for i, ve := range m.valErrors {
-		line := ve.Error()
-		if i == m.modalCursor {
-			b.WriteString(selectedRowStyle.Render("> " + line))
-		} else {
-			b.WriteString("  " + line)
+		lines[i] = ve.Error()
+		if w := lipgloss.Width(lines[i]); w > maxW {
+			maxW = w
 		}
+	}
+	for i, line := range lines {
+		b.WriteString(renderSelectableRow(line, maxW, i == m.modalCursor))
 		b.WriteByte('\n')
 	}
 	return boxStyle.Render(b.String())

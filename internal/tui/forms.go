@@ -3,6 +3,7 @@ package tui
 import (
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strconv"
 	"strings"
@@ -10,7 +11,9 @@ import (
 	"github.com/MoonSunMoor/wakeupProxy/internal/config"
 	"github.com/MoonSunMoor/wakeupProxy/internal/netutil"
 	"github.com/charmbracelet/bubbles/key"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
+	"github.com/charmbracelet/lipgloss"
 )
 
 type targetDraft struct {
@@ -50,6 +53,591 @@ type globalDraft struct {
 	wakeTimeout       string
 	wakeCooldown      string
 	pollInterval      string
+}
+
+func newFormTheme() *huh.Theme {
+	t := huh.ThemeCharm()
+
+	t.Focused.Base = t.Focused.Base.BorderForeground(lipgloss.Color("62"))
+	t.Focused.Card = t.Focused.Base
+	t.Focused.Title = lipgloss.NewStyle().Foreground(lipgloss.Color("111")).Bold(true)
+	t.Focused.NoteTitle = lipgloss.NewStyle().Foreground(lipgloss.Color("111")).Bold(true).MarginBottom(1)
+	t.Focused.Description = lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	t.Focused.ErrorIndicator = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).SetString(" *")
+	t.Focused.ErrorMessage = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).SetString(" *")
+
+	t.Focused.SelectSelector = lipgloss.NewStyle()
+	t.Focused.MultiSelectSelector = lipgloss.NewStyle()
+	t.Focused.SelectedPrefix = lipgloss.NewStyle()
+	t.Focused.UnselectedPrefix = lipgloss.NewStyle()
+	t.Focused.Option = normalOptionStyle
+	t.Focused.SelectedOption = okStyle
+	t.Focused.UnselectedOption = normalOptionStyle
+
+	t.Focused.TextInput.Cursor = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))
+	t.Focused.TextInput.Placeholder = lipgloss.NewStyle().Foreground(lipgloss.Color("242"))
+	t.Focused.TextInput.Prompt = lipgloss.NewStyle()
+	t.Focused.TextInput.Text = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+
+	t.Blurred = t.Focused
+	t.Blurred.Base = t.Focused.Base.BorderStyle(lipgloss.HiddenBorder())
+	t.Blurred.Card = t.Blurred.Base
+	t.Blurred.NextIndicator = lipgloss.NewStyle()
+	t.Blurred.PrevIndicator = lipgloss.NewStyle()
+
+	t.Group.Title = t.Focused.Title
+	t.Group.Description = t.Focused.Description
+	return t
+}
+
+func newTextInput() *huh.Input {
+	return huh.NewInput().Prompt("")
+}
+
+func newStyledForm(termWidth, maxWidth int, fields ...huh.Field) *huh.Form {
+	w := maxWidth
+	if termWidth > 10 {
+		w = min(termWidth-6, maxWidth)
+	}
+	return huh.NewForm(huh.NewGroup(fields...)).
+		WithTheme(newFormTheme()).
+		WithKeyMap(newFormKeyMap()).
+		WithShowHelp(false).
+		WithWidth(w)
+}
+
+func clampScrollOffset(yOffset, cursorIdx, totalOpts, vpHeight int) int {
+	if totalOpts <= 0 || vpHeight <= 0 || totalOpts <= vpHeight {
+		return 0
+	}
+	if cursorIdx < yOffset {
+		yOffset = cursorIdx
+	}
+	if cursorIdx >= yOffset+vpHeight {
+		yOffset = cursorIdx - vpHeight + 1
+	}
+	maxOff := totalOpts - vpHeight
+	if yOffset > maxOff {
+		yOffset = maxOff
+	}
+	if yOffset < 0 {
+		yOffset = 0
+	}
+	return yOffset
+}
+
+func maxOptionWidth(options []huh.Option[string], availWidth int) int {
+	maxW := 0
+	for _, opt := range options {
+		w := lipgloss.Width(opt.Key)
+		if availWidth > 0 && w > availWidth {
+			w = availWidth
+		}
+		if w > maxW {
+			maxW = w
+		}
+	}
+	return maxW
+}
+
+// selectField wraps *huh.Select[string] to preserve all key handling and validation
+// while rendering 0-column aligned options with orthogonal cursor/selected styling.
+type selectField struct {
+	inner       *huh.Select[string]
+	title       string
+	description string
+	options     []huh.Option[string]
+	focused     bool
+	width       int
+	height      int
+	yOffset     int
+	theme       *huh.Theme
+}
+
+var _ huh.Field = (*selectField)(nil)
+
+func newSelectField(fieldKey, title string, options []huh.Option[string], val *string) *selectField {
+	optsCopy := append([]huh.Option[string](nil), options...)
+	inner := huh.NewSelect[string]().
+		Key(fieldKey).
+		Title(title).
+		Options(optsCopy...).
+		Filtering(false).
+		Value(val)
+	inner.WithKeyMap(newFormKeyMap())
+	return &selectField{
+		inner:   inner,
+		title:   title,
+		options: optsCopy,
+	}
+}
+
+func (f *selectField) Description(desc string) *selectField {
+	f.description = desc
+	f.inner.Description(desc)
+	return f
+}
+
+func (f *selectField) Validate(validate func(string) error) *selectField {
+	if validate != nil {
+		f.inner.Validate(validate)
+	}
+	return f
+}
+
+func (f *selectField) Height(h int) *selectField {
+	f.height = h
+	f.inner.Height(h)
+	f.syncViewport()
+	return f
+}
+
+func (f *selectField) Init() tea.Cmd { return f.inner.Init() }
+
+func (f *selectField) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := f.inner.Update(msg)
+	if s, ok := next.(*huh.Select[string]); ok {
+		f.inner = s
+	}
+	f.syncViewport()
+	return f, cmd
+}
+
+func (f *selectField) Focus() tea.Cmd {
+	f.focused = true
+	cmd := f.inner.Focus()
+	f.syncViewport()
+	return cmd
+}
+
+func (f *selectField) Blur() tea.Cmd {
+	f.focused = false
+	return f.inner.Blur()
+}
+
+func (f *selectField) Error() error { return f.inner.Error() }
+func (f *selectField) Run() error   { return f.inner.Run() }
+func (f *selectField) RunAccessible(w io.Writer, r io.Reader) error {
+	return f.inner.RunAccessible(w, r)
+}
+func (f *selectField) Skip() bool              { return f.inner.Skip() }
+func (f *selectField) Zoom() bool              { return f.inner.Zoom() }
+func (f *selectField) KeyBinds() []key.Binding { return f.inner.KeyBinds() }
+func (f *selectField) GetKey() string          { return f.inner.GetKey() }
+func (f *selectField) GetValue() any           { return f.inner.GetValue() }
+
+func (f *selectField) WithTheme(t *huh.Theme) huh.Field {
+	f.theme = t
+	f.inner.WithTheme(t)
+	return f
+}
+
+func (f *selectField) WithAccessible(a bool) huh.Field {
+	f.inner.WithAccessible(a)
+	return f
+}
+
+func (f *selectField) WithKeyMap(k *huh.KeyMap) huh.Field {
+	f.inner.WithKeyMap(k)
+	return f
+}
+
+func (f *selectField) WithWidth(w int) huh.Field {
+	f.width = w
+	f.inner.WithWidth(w)
+	return f
+}
+
+func (f *selectField) WithHeight(h int) huh.Field {
+	f.height = h
+	f.inner.WithHeight(h)
+	f.syncViewport()
+	return f
+}
+
+func (f *selectField) WithPosition(p huh.FieldPosition) huh.Field {
+	f.inner.WithPosition(p)
+	return f
+}
+
+func (f *selectField) activeStyles() *huh.FieldStyles {
+	t := f.theme
+	if t == nil {
+		t = newFormTheme()
+	}
+	if f.focused {
+		return &t.Focused
+	}
+	return &t.Blurred
+}
+
+func (f *selectField) cursorIndex() int {
+	if len(f.options) == 0 {
+		return 0
+	}
+	if hovered, ok := f.inner.Hovered(); ok {
+		for i, opt := range f.options {
+			if opt.Value == hovered {
+				return i
+			}
+		}
+	}
+	if val, ok := f.inner.GetValue().(string); ok {
+		for i, opt := range f.options {
+			if opt.Value == val {
+				return i
+			}
+		}
+	}
+	return 0
+}
+
+func (f *selectField) headerLineCount() int {
+	n := 0
+	if f.title != "" {
+		n++
+	}
+	if f.description != "" {
+		n++
+	}
+	return n
+}
+
+func (f *selectField) syncViewport() {
+	if f.height <= 0 {
+		f.yOffset = 0
+		return
+	}
+	vpHeight := max(1, f.height-f.headerLineCount())
+	f.yOffset = clampScrollOffset(f.yOffset, f.cursorIndex(), len(f.options), vpHeight)
+}
+
+func (f *selectField) View() string {
+	styles := f.activeStyles()
+	availWidth := 0
+	if f.width > 0 {
+		availWidth = max(1, f.width-styles.Base.GetHorizontalFrameSize())
+	}
+
+	var parts []string
+	if f.title != "" {
+		titleLine := styles.Title.Render(f.title)
+		if f.inner.Error() != nil {
+			titleLine += styles.ErrorIndicator.String()
+		}
+		parts = append(parts, titleLine)
+	}
+	if f.description != "" {
+		parts = append(parts, styles.Description.Render(f.description))
+	}
+
+	selIdx := f.cursorIndex()
+	start, end := 0, len(f.options)
+	if f.height > 0 && len(f.options) > 0 {
+		vpHeight := max(1, f.height-f.headerLineCount())
+		f.yOffset = clampScrollOffset(f.yOffset, selIdx, len(f.options), vpHeight)
+		start = f.yOffset
+		end = min(len(f.options), start+vpHeight)
+	}
+
+	ascii := isASCIIProfile()
+	maxW := maxOptionWidth(f.options, availWidth)
+	optLines := make([]string, 0, end-start)
+	for i := start; i < end; i++ {
+		opt := f.options[i]
+		isSel := i == selIdx
+		if ascii {
+			suffix := ""
+			if isSel {
+				suffix += " [선택됨]"
+			}
+			if f.focused && isSel {
+				suffix += " ←"
+			}
+			label := opt.Key
+			if availWidth > lipgloss.Width(suffix)+1 {
+				label = truncateDisplay(label, availWidth-lipgloss.Width(suffix))
+			}
+			optLines = append(optLines, label+suffix)
+			continue
+		}
+
+		label := opt.Key
+		if availWidth > 0 {
+			label = truncateDisplay(label, availWidth)
+		}
+		padded := padRight(label, maxW)
+		switch {
+		case f.focused && isSel:
+			optLines = append(optLines, selectedOptionCursorStyle.Render(padded))
+		case f.focused && !isSel:
+			optLines = append(optLines, normalOptionStyle.Render(padded))
+		case !f.focused && isSel:
+			optLines = append(optLines, okStyle.Render(padded))
+		default:
+			optLines = append(optLines, blurredUnselectedSelectStyle.Render(padded))
+		}
+	}
+	if len(optLines) > 0 {
+		parts = append(parts, strings.Join(optLines, "\n"))
+	}
+
+	base := styles.Base
+	if f.width > 0 {
+		base = base.Width(f.width)
+	}
+	if f.height > 0 {
+		base = base.Height(f.height)
+	}
+	return base.Render(strings.Join(parts, "\n"))
+}
+
+// multiSelectField wraps *huh.MultiSelect[string] to preserve all key handling and validation
+// while rendering 0-column aligned options with orthogonal cursor/selected styling.
+type multiSelectField struct {
+	inner       *huh.MultiSelect[string]
+	title       string
+	description string
+	options     []huh.Option[string]
+	focused     bool
+	width       int
+	height      int
+	yOffset     int
+	theme       *huh.Theme
+}
+
+var _ huh.Field = (*multiSelectField)(nil)
+
+func newMultiSelectField(fieldKey, title string, options []huh.Option[string], val *[]string) *multiSelectField {
+	optsCopy := append([]huh.Option[string](nil), options...)
+	inner := huh.NewMultiSelect[string]().
+		Key(fieldKey).
+		Title(title).
+		Options(optsCopy...).
+		Filterable(false).
+		Value(val)
+	inner.WithKeyMap(newFormKeyMap())
+	return &multiSelectField{
+		inner:   inner,
+		title:   title,
+		options: optsCopy,
+	}
+}
+
+func (f *multiSelectField) Description(desc string) *multiSelectField {
+	f.description = desc
+	f.inner.Description(desc)
+	return f
+}
+
+func (f *multiSelectField) Validate(validate func([]string) error) *multiSelectField {
+	if validate != nil {
+		f.inner.Validate(validate)
+	}
+	return f
+}
+
+func (f *multiSelectField) Height(h int) *multiSelectField {
+	f.height = h
+	f.inner.Height(h)
+	f.syncViewport()
+	return f
+}
+
+func (f *multiSelectField) Init() tea.Cmd { return f.inner.Init() }
+
+func (f *multiSelectField) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := f.inner.Update(msg)
+	if ms, ok := next.(*huh.MultiSelect[string]); ok {
+		f.inner = ms
+	}
+	f.syncViewport()
+	return f, cmd
+}
+
+func (f *multiSelectField) Focus() tea.Cmd {
+	f.focused = true
+	cmd := f.inner.Focus()
+	f.syncViewport()
+	return cmd
+}
+
+func (f *multiSelectField) Blur() tea.Cmd {
+	f.focused = false
+	return f.inner.Blur()
+}
+
+func (f *multiSelectField) Error() error { return f.inner.Error() }
+func (f *multiSelectField) Run() error   { return f.inner.Run() }
+func (f *multiSelectField) RunAccessible(w io.Writer, r io.Reader) error {
+	return f.inner.RunAccessible(w, r)
+}
+func (f *multiSelectField) Skip() bool              { return f.inner.Skip() }
+func (f *multiSelectField) Zoom() bool              { return f.inner.Zoom() }
+func (f *multiSelectField) KeyBinds() []key.Binding { return f.inner.KeyBinds() }
+func (f *multiSelectField) GetKey() string          { return f.inner.GetKey() }
+func (f *multiSelectField) GetValue() any           { return f.inner.GetValue() }
+
+func (f *multiSelectField) WithTheme(t *huh.Theme) huh.Field {
+	f.theme = t
+	f.inner.WithTheme(t)
+	return f
+}
+
+func (f *multiSelectField) WithAccessible(a bool) huh.Field {
+	f.inner.WithAccessible(a)
+	return f
+}
+
+func (f *multiSelectField) WithKeyMap(k *huh.KeyMap) huh.Field {
+	f.inner.WithKeyMap(k)
+	return f
+}
+
+func (f *multiSelectField) WithWidth(w int) huh.Field {
+	f.width = w
+	f.inner.WithWidth(w)
+	return f
+}
+
+func (f *multiSelectField) WithHeight(h int) huh.Field {
+	f.height = h
+	f.inner.WithHeight(h)
+	f.syncViewport()
+	return f
+}
+
+func (f *multiSelectField) WithPosition(p huh.FieldPosition) huh.Field {
+	f.inner.WithPosition(p)
+	return f
+}
+
+func (f *multiSelectField) activeStyles() *huh.FieldStyles {
+	t := f.theme
+	if t == nil {
+		t = newFormTheme()
+	}
+	if f.focused {
+		return &t.Focused
+	}
+	return &t.Blurred
+}
+
+func (f *multiSelectField) cursorIndex() int {
+	if len(f.options) == 0 {
+		return 0
+	}
+	if hovered, ok := f.inner.Hovered(); ok {
+		for i, opt := range f.options {
+			if opt.Value == hovered {
+				return i
+			}
+		}
+	}
+	return 0
+}
+
+func (f *multiSelectField) headerLineCount() int {
+	n := 0
+	if f.title != "" {
+		n++
+	}
+	if f.description != "" {
+		n++
+	}
+	return n
+}
+
+func (f *multiSelectField) syncViewport() {
+	if f.height <= 0 {
+		f.yOffset = 0
+		return
+	}
+	vpHeight := max(1, f.height-f.headerLineCount())
+	f.yOffset = clampScrollOffset(f.yOffset, f.cursorIndex(), len(f.options), vpHeight)
+}
+
+func (f *multiSelectField) View() string {
+	styles := f.activeStyles()
+	availWidth := 0
+	if f.width > 0 {
+		availWidth = max(1, f.width-styles.Base.GetHorizontalFrameSize())
+	}
+
+	var parts []string
+	if f.title != "" {
+		titleLine := styles.Title.Render(f.title)
+		if f.inner.Error() != nil {
+			titleLine += styles.ErrorIndicator.String()
+		}
+		parts = append(parts, titleLine)
+	}
+	if f.description != "" {
+		parts = append(parts, styles.Description.Render(f.description))
+	}
+
+	cursorIdx := f.cursorIndex()
+	selectedVals, _ := f.inner.GetValue().([]string)
+
+	start, end := 0, len(f.options)
+	if f.height > 0 && len(f.options) > 0 {
+		vpHeight := max(1, f.height-f.headerLineCount())
+		f.yOffset = clampScrollOffset(f.yOffset, cursorIdx, len(f.options), vpHeight)
+		start = f.yOffset
+		end = min(len(f.options), start+vpHeight)
+	}
+
+	ascii := isASCIIProfile()
+	maxW := maxOptionWidth(f.options, availWidth)
+	optLines := make([]string, 0, end-start)
+	for i := start; i < end; i++ {
+		opt := f.options[i]
+		isCursor := f.focused && i == cursorIdx
+		isSel := slices.Contains(selectedVals, opt.Value)
+		if ascii {
+			suffix := ""
+			if isSel {
+				suffix += " [선택됨]"
+			}
+			if isCursor {
+				suffix += " ←"
+			}
+			label := opt.Key
+			if availWidth > lipgloss.Width(suffix)+1 {
+				label = truncateDisplay(label, availWidth-lipgloss.Width(suffix))
+			}
+			optLines = append(optLines, label+suffix)
+			continue
+		}
+
+		label := opt.Key
+		if availWidth > 0 {
+			label = truncateDisplay(label, availWidth)
+		}
+		padded := padRight(label, maxW)
+		switch {
+		case isSel && isCursor:
+			optLines = append(optLines, selectedOptionCursorStyle.Render(padded))
+		case isSel && !isCursor:
+			optLines = append(optLines, okStyle.Render(padded))
+		case !isSel && isCursor:
+			optLines = append(optLines, selectedRowStyle.Render(padded))
+		default:
+			optLines = append(optLines, normalOptionStyle.Render(padded))
+		}
+	}
+	if len(optLines) > 0 {
+		parts = append(parts, strings.Join(optLines, "\n"))
+	}
+
+	base := styles.Base
+	if f.width > 0 {
+		base = base.Width(f.width)
+	}
+	if f.height > 0 {
+		base = base.Height(f.height)
+	}
+	return base.Render(strings.Join(parts, "\n"))
 }
 
 func newFormKeyMap() *huh.KeyMap {
@@ -150,12 +738,13 @@ func (m *Model) buildTargetForm() *huh.Form {
 	}
 
 	fields := []huh.Field{
-		huh.NewInput().
+		newTextInput().
 			Key("name").
 			Title("타깃 이름").
+			Placeholder("pc1").
 			Value(&m.tDraft.name).
 			Validate(validateRequiredName("타깃")),
-		huh.NewInput().
+		newTextInput().
 			Key("ip").
 			Title("IP 주소 (" + scanHint + ")").
 			Placeholder("192.168.0.21").
@@ -164,7 +753,7 @@ func (m *Model) buildTargetForm() *huh.Form {
 				_, err := netutil.ParseIPv4Host(s)
 				return err
 			}),
-		huh.NewInput().
+		newTextInput().
 			Key("mac").
 			Title("MAC 주소").
 			Placeholder("aa:bb:cc:dd:ee:01").
@@ -179,7 +768,7 @@ func (m *Model) buildTargetForm() *huh.Form {
 				_, _, err := netutil.NormalizeMAC(s)
 				return err
 			}),
-		huh.NewInput().
+		newTextInput().
 			Key("alias").
 			Title("별칭 IP (선택)").
 			Placeholder("10.66.1.12").
@@ -195,12 +784,7 @@ func (m *Model) buildTargetForm() *huh.Form {
 
 	if len(profOpts) > 0 {
 		fields = append(fields,
-			huh.NewMultiSelect[string]().
-				Key("profiles").
-				Title("프로파일 (스페이스로 선택/해제)").
-				Options(profOpts...).
-				Filterable(false).
-				Value(&m.tDraft.profiles),
+			newMultiSelectField("profiles", "프로파일 (스페이스로 선택/해제)", profOpts, &m.tDraft.profiles),
 		)
 	} else {
 		fields = append(fields,
@@ -211,12 +795,7 @@ func (m *Model) buildTargetForm() *huh.Form {
 	}
 	if len(clientOpts) > 0 {
 		fields = append(fields,
-			huh.NewMultiSelect[string]().
-				Key("allow").
-				Title("허용 클라이언트 (스페이스로 선택/해제)").
-				Options(clientOpts...).
-				Filterable(false).
-				Value(&m.tDraft.allow),
+			newMultiSelectField("allow", "허용 클라이언트 (스페이스로 선택/해제)", clientOpts, &m.tDraft.allow),
 		)
 	} else {
 		fields = append(fields,
@@ -227,19 +806,14 @@ func (m *Model) buildTargetForm() *huh.Form {
 	}
 
 	fields = append(fields,
-		huh.NewInput().
+		newTextInput().
 			Key("note").
 			Title("메모 (note, 선택)").
+			Placeholder("optional").
 			Value(&m.tDraft.note),
 	)
 
-	form := huh.NewForm(huh.NewGroup(fields...)).
-		WithKeyMap(newFormKeyMap()).
-		WithShowHelp(false)
-	if m.width > 10 {
-		form = form.WithWidth(min(m.width-6, 90))
-	}
-	return form
+	return newStyledForm(m.width, 90, fields...)
 }
 
 func (m *Model) commitTargetDraft() error {
@@ -282,9 +856,10 @@ func (m *Model) commitTargetDraft() error {
 
 func (m *Model) buildClientForm() *huh.Form {
 	fields := []huh.Field{
-		huh.NewInput().
+		newTextInput().
 			Key("name").
 			Title("클라이언트 이름").
+			Placeholder("laptop").
 			Value(&m.cDraft.name).
 			Validate(func(s string) error {
 				name := strings.TrimSpace(s)
@@ -296,7 +871,7 @@ func (m *Model) buildClientForm() *huh.Form {
 				}
 				return nil
 			}),
-		huh.NewInput().
+		newTextInput().
 			Key("cidr").
 			Title("IP/CIDR").
 			Placeholder("10.66.0.2/32").
@@ -305,19 +880,14 @@ func (m *Model) buildClientForm() *huh.Form {
 				_, err := netutil.ParseIPv4OrCIDR(s)
 				return err
 			}),
-		huh.NewInput().
+		newTextInput().
 			Key("note").
 			Title("메모 (note, 선택)").
+			Placeholder("optional").
 			Value(&m.cDraft.note),
 	}
 
-	form := huh.NewForm(huh.NewGroup(fields...)).
-		WithKeyMap(newFormKeyMap()).
-		WithShowHelp(false)
-	if m.width > 10 {
-		form = form.WithWidth(min(m.width-6, 80))
-	}
-	return form
+	return newStyledForm(m.width, 80, fields...)
 }
 
 func (m *Model) hasClient(name string) bool {
@@ -348,10 +918,15 @@ func (m *Model) commitClientDraft() error {
 }
 
 func (m *Model) buildProfileForm() *huh.Form {
+	wakeOpts := []huh.Option[string]{
+		huh.NewOption("auto (연결 시 자동으로 매직 패킷 송신)", config.WakeAuto),
+		huh.NewOption("never (깨어 있을 때만 연결)", config.WakeNever),
+	}
 	fields := []huh.Field{
-		huh.NewInput().
+		newTextInput().
 			Key("name").
 			Title("프로파일 이름").
+			Placeholder("rdp").
 			Value(&m.pDraft.name).
 			Validate(func(s string) error {
 				name := strings.TrimSpace(s)
@@ -363,46 +938,33 @@ func (m *Model) buildProfileForm() *huh.Form {
 				}
 				return nil
 			}),
-		huh.NewInput().
+		newTextInput().
 			Key("port").
 			Title("포트 (1~65535)").
 			Placeholder("3389").
 			Value(&m.pDraft.port).
 			Validate(validatePortStr),
-		huh.NewSelect[string]().
-			Key("wake").
-			Title("깨우기 정책 (wake)").
-			Options(
-				huh.NewOption("auto (연결 시 자동으로 매직 패킷 송신)", config.WakeAuto),
-				huh.NewOption("never (깨어 있을 때만 연결)", config.WakeNever),
-			).
-			Filtering(false).
-			Value(&m.pDraft.wake),
-		huh.NewInput().
+		newSelectField("wake", "깨우기 정책 (wake)", wakeOpts, &m.pDraft.wake),
+		newTextInput().
 			Key("idle_timeout").
 			Title("유휴 제한 시간 (idle_timeout, 0=사용 안 함)").
 			Placeholder("0").
 			Value(&m.pDraft.idleTimeout).
 			Validate(validateOptionalDurationStr),
-		huh.NewInput().
+		newTextInput().
 			Key("idle_bytes").
 			Title("유휴 판정 전송량 이하 기준 바이트 (idle_bytes)").
 			Placeholder("0").
 			Value(&m.pDraft.idleBytes).
 			Validate(validateOptionalNonNegIntStr),
-		huh.NewInput().
+		newTextInput().
 			Key("note").
 			Title("메모 (note, 선택)").
+			Placeholder("optional").
 			Value(&m.pDraft.note),
 	}
 
-	form := huh.NewForm(huh.NewGroup(fields...)).
-		WithKeyMap(newFormKeyMap()).
-		WithShowHelp(false)
-	if m.width > 10 {
-		form = form.WithWidth(min(m.width-6, 80))
-	}
-	return form
+	return newStyledForm(m.width, 80, fields...)
 }
 
 func (m *Model) hasProfile(name string) bool {
@@ -491,18 +1053,8 @@ func (m *Model) buildGlobalForm() *huh.Form {
 	}
 
 	fields := []huh.Field{
-		huh.NewSelect[string]().
-			Key("lan_interface").
-			Title("LAN 인터페이스").
-			Options(lanOpts...).
-			Filtering(false).
-			Value(&m.gDraft.lanInterface),
-		huh.NewMultiSelect[string]().
-			Key("ingress_interfaces").
-			Title("유입 인터페이스 (스페이스로 다중 선택)").
-			Options(ingOpts...).
-			Filterable(false).
-			Value(&m.gDraft.ingressInterfaces).
+		newSelectField("lan_interface", "LAN 인터페이스", lanOpts, &m.gDraft.lanInterface),
+		newMultiSelectField("ingress_interfaces", "유입 인터페이스 (스페이스로 다중 선택)", ingOpts, &m.gDraft.ingressInterfaces).
 			Validate(func(sel []string) error {
 				if len(sel) == 0 {
 					return errors.New("유입 인터페이스를 하나 이상 선택해 주세요")
@@ -515,35 +1067,33 @@ func (m *Model) buildGlobalForm() *huh.Form {
 				}
 				return nil
 			}),
-		huh.NewInput().
+		newTextInput().
 			Key("proxy_port").
 			Title("프록시 리슨 포트 (proxy_port, 1024~65535)").
+			Placeholder("13389").
 			Value(&m.gDraft.proxyPort).
 			Validate(validateProxyPortStr),
-		huh.NewInput().
+		newTextInput().
 			Key("wake_timeout").
 			Title("깨우기 대기 제한 시간 (wake_timeout)").
+			Placeholder("120s").
 			Value(&m.gDraft.wakeTimeout).
 			Validate(validatePositiveDurationStr),
-		huh.NewInput().
+		newTextInput().
 			Key("wake_cooldown").
 			Title("매직 패킷 재송신 간격 (wake_cooldown)").
+			Placeholder("10s").
 			Value(&m.gDraft.wakeCooldown).
 			Validate(validatePositiveDurationStr),
-		huh.NewInput().
+		newTextInput().
 			Key("poll_interval").
 			Title("포트 확인 간격 (poll_interval)").
+			Placeholder("2s").
 			Value(&m.gDraft.pollInterval).
 			Validate(validatePositiveDurationStr),
 	}
 
-	form := huh.NewForm(huh.NewGroup(fields...)).
-		WithKeyMap(newFormKeyMap()).
-		WithShowHelp(false)
-	if m.width > 10 {
-		form = form.WithWidth(min(m.width-6, 85))
-	}
-	return form
+	return newStyledForm(m.width, 85, fields...)
 }
 
 func (m *Model) commitGlobalDraft() error {
